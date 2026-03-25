@@ -15,7 +15,11 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use flowcus_ipfix::protocol::*;
+use flowcus_query::ast::{
+    AggExpr, Query, SelectExpr, SelectField, SelectFieldExpr, Stage, TimeRange,
+};
 use flowcus_storage::cache::StorageCache;
+use flowcus_storage::executor::QueryExecutor;
 use flowcus_storage::granule;
 use flowcus_storage::part;
 use flowcus_storage::schema::StorageType;
@@ -894,5 +898,372 @@ fn test_cache_survives_concurrent_reads() {
     let (hits, misses) = cache.stats();
     assert_eq!(hits + misses, 8);
     assert!(misses >= 1);
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Query consistency helpers
+// ---------------------------------------------------------------------------
+
+fn make_executor(dir: &Path) -> QueryExecutor {
+    QueryExecutor::new(dir, 8192)
+}
+
+/// Create a record with only sourceIPv4Address and octetDeltaCount (no destination).
+fn make_record_no_dst(src: Ipv4Addr, bytes: u64) -> DataRecord {
+    DataRecord {
+        fields: vec![
+            DataField {
+                spec: FieldSpecifier {
+                    element_id: 8,
+                    field_length: 4,
+                    enterprise_id: 0,
+                },
+                name: "sourceIPv4Address".into(),
+                value: FieldValue::Ipv4(src),
+            },
+            DataField {
+                spec: FieldSpecifier {
+                    element_id: 1,
+                    field_length: 8,
+                    enterprise_id: 0,
+                },
+                name: "octetDeltaCount".into(),
+                value: FieldValue::Unsigned64(bytes),
+            },
+        ],
+    }
+}
+
+/// Build a query covering a wide absolute time range with the given stages.
+fn make_wide_query(stages: Vec<Stage>) -> Query {
+    Query {
+        time_range: TimeRange::Absolute {
+            start: "2023-01-01".into(),
+            end: "2025-01-01".into(),
+        },
+        stages,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 16. test_query_column_mapping_across_heterogeneous_parts
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_query_column_mapping_across_heterogeneous_parts() {
+    let dir = test_dir("query_heterogeneous_columns");
+
+    // Part A: sourceIPv4Address + octetDeltaCount (no destination), export_time T1
+    let mut writer = tiny_flush_writer(&dir);
+    let msg_a = make_message_with_time(
+        vec![make_record_no_dst(Ipv4Addr::new(10, 0, 0, 1), 1000)],
+        1_700_000_000,
+    );
+    writer.ingest(&msg_a);
+    writer.flush_all();
+
+    // Part B: sourceIPv4Address + destinationIPv4Address + octetDeltaCount, export_time T2
+    let msg_b = make_message_with_time(
+        vec![make_record(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(192, 168, 1, 2),
+            2000,
+        )],
+        1_700_000_100,
+    );
+    writer.ingest(&msg_b);
+    writer.flush_all();
+
+    let executor = make_executor(&dir);
+    let query = make_wide_query(vec![]);
+    let result = executor.execute(&query, 0, 100, None).unwrap();
+
+    // Both parts should be returned
+    assert_eq!(result.rows.len(), 2, "expected 2 rows from 2 parts");
+
+    // Find column indices in result
+    let src_idx = result
+        .columns
+        .iter()
+        .position(|c| c == "sourceIPv4Address")
+        .expect("sourceIPv4Address must be in result columns");
+    let dst_idx = result
+        .columns
+        .iter()
+        .position(|c| c == "destinationIPv4Address");
+    let bytes_idx = result
+        .columns
+        .iter()
+        .position(|c| c == "octetDeltaCount")
+        .expect("octetDeltaCount must be in result columns");
+
+    // Rows are sorted newest-first, so Part B (T2) comes first
+    let row_b = &result.rows[0]; // newer part (has destination)
+    let row_a = &result.rows[1]; // older part (no destination)
+
+    // Verify Part B row has correct values
+    assert_eq!(
+        row_b[src_idx].as_str().unwrap(),
+        "10.0.0.2",
+        "Part B source IP must be correct"
+    );
+    assert_eq!(
+        row_b[bytes_idx].as_u64().unwrap(),
+        2000,
+        "Part B bytes must be correct"
+    );
+    if let Some(di) = dst_idx {
+        assert_eq!(
+            row_b[di].as_str().unwrap(),
+            "192.168.1.2",
+            "Part B destination IP must be correct"
+        );
+    }
+
+    // Verify Part A row has correct values and null for missing destination
+    assert_eq!(
+        row_a[src_idx].as_str().unwrap(),
+        "10.0.0.1",
+        "Part A source IP must be correct"
+    );
+    assert_eq!(
+        row_a[bytes_idx].as_u64().unwrap(),
+        1000,
+        "Part A bytes must be correct"
+    );
+    if let Some(di) = dst_idx {
+        assert!(
+            row_a[di].is_null(),
+            "Part A destination must be null (column not in part)"
+        );
+    }
+
+    // Critical check: bytes column must NEVER contain an IP address value.
+    // This is the exact bug scenario — column misalignment would cause this.
+    for (i, row) in result.rows.iter().enumerate() {
+        let bytes_val = &row[bytes_idx];
+        assert!(
+            bytes_val.is_u64() || bytes_val.is_number(),
+            "row {i}: octetDeltaCount must be numeric, got {bytes_val}"
+        );
+    }
+
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 17. test_query_column_mapping_with_explicit_select
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_query_column_mapping_with_explicit_select() {
+    let dir = test_dir("query_explicit_select_columns");
+
+    // Part A: no destination column
+    let mut writer = tiny_flush_writer(&dir);
+    let msg_a = make_message_with_time(
+        vec![make_record_no_dst(Ipv4Addr::new(10, 0, 0, 1), 500)],
+        1_700_000_000,
+    );
+    writer.ingest(&msg_a);
+    writer.flush_all();
+
+    // Part B: has destination column
+    let msg_b = make_message_with_time(
+        vec![make_record(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(192, 168, 1, 2),
+            600,
+        )],
+        1_700_000_100,
+    );
+    writer.ingest(&msg_b);
+    writer.flush_all();
+
+    let executor = make_executor(&dir);
+    let query = make_wide_query(vec![Stage::Select(SelectExpr::Fields(vec![
+        SelectField {
+            expr: SelectFieldExpr::Field("sourceIPv4Address".into()),
+            alias: None,
+        },
+        SelectField {
+            expr: SelectFieldExpr::Field("destinationIPv4Address".into()),
+            alias: None,
+        },
+    ]))]);
+
+    let result = executor.execute(&query, 0, 100, None).unwrap();
+
+    assert_eq!(result.columns.len(), 2);
+    assert_eq!(result.columns[0], "sourceIPv4Address");
+    assert_eq!(result.columns[1], "destinationIPv4Address");
+
+    // Row from Part B (newer): both columns populated
+    let row_b = &result.rows[0];
+    assert_eq!(row_b[0].as_str().unwrap(), "10.0.0.2");
+    assert_eq!(row_b[1].as_str().unwrap(), "192.168.1.2");
+
+    // Row from Part A (older): destination is null
+    let row_a = &result.rows[1];
+    assert_eq!(row_a[0].as_str().unwrap(), "10.0.0.1");
+    assert!(row_a[1].is_null(), "missing column must be null");
+
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 18. test_query_early_termination_within_part
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_query_early_termination_within_part() {
+    let dir = test_dir("query_early_termination");
+
+    let mut writer = tiny_flush_writer(&dir);
+    // Ingest many records in a single message so they land in one part
+    let records: Vec<DataRecord> = (0..50)
+        .map(|i| {
+            make_record(
+                Ipv4Addr::new(10, 0, 0, (i % 254 + 1) as u8),
+                Ipv4Addr::new(192, 168, 1, (i % 254 + 1) as u8),
+                (i + 1) * 100,
+            )
+        })
+        .collect();
+    let msg = make_message_with_time(records, 1_700_000_000);
+    writer.ingest(&msg);
+    writer.flush_all();
+
+    let executor = make_executor(&dir);
+    let query = make_wide_query(vec![Stage::Aggregate(AggExpr::Limit(5))]);
+
+    let result = executor.execute(&query, 0, 5, None).unwrap();
+    assert_eq!(result.rows.len(), 5, "LIMIT 5 must return exactly 5 rows");
+
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 19. test_query_parts_read_newest_first
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_query_parts_read_newest_first() {
+    let dir = test_dir("query_newest_first");
+
+    let mut writer = tiny_flush_writer(&dir);
+
+    // Older part: export_time = T1, bytes = 1111
+    let msg_old = make_message_with_time(
+        vec![make_record(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 1),
+            1111,
+        )],
+        1_700_000_000,
+    );
+    writer.ingest(&msg_old);
+    writer.flush_all();
+
+    // Newer part: export_time = T2, bytes = 2222
+    let msg_new = make_message_with_time(
+        vec![make_record(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(192, 168, 1, 2),
+            2222,
+        )],
+        1_700_000_100,
+    );
+    writer.ingest(&msg_new);
+    writer.flush_all();
+
+    let executor = make_executor(&dir);
+    // Request only 1 row — should come from the newer part
+    let query = make_wide_query(vec![Stage::Aggregate(AggExpr::Limit(1))]);
+    let result = executor.execute(&query, 0, 1, None).unwrap();
+
+    assert_eq!(result.rows.len(), 1);
+    let bytes_idx = result
+        .columns
+        .iter()
+        .position(|c| c == "octetDeltaCount")
+        .expect("octetDeltaCount column");
+    assert_eq!(
+        result.rows[0][bytes_idx].as_u64().unwrap(),
+        2222,
+        "LIMIT 1 with newest-first must return the newer row"
+    );
+
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 20. test_query_pagination_total_matching_not_capped_by_limit
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_query_pagination_total_matching_not_capped_by_limit() {
+    let dir = test_dir("query_pagination_total");
+
+    let mut writer = tiny_flush_writer(&dir);
+    // Ingest 30 records so total_matching > any reasonable page size
+    let records: Vec<DataRecord> = (0..30)
+        .map(|i| {
+            make_record(
+                Ipv4Addr::new(10, 0, 0, (i % 254 + 1) as u8),
+                Ipv4Addr::new(192, 168, 1, (i % 254 + 1) as u8),
+                (i + 1) * 100,
+            )
+        })
+        .collect();
+    let msg = make_message_with_time(records, 1_700_000_000);
+    writer.ingest(&msg);
+    writer.flush_all();
+
+    let executor = make_executor(&dir);
+    let query = make_wide_query(vec![]);
+
+    // Page 1: offset=0, limit=5
+    let page1 = executor.execute(&query, 0, 5, None).unwrap();
+    assert_eq!(page1.rows.len(), 5, "page 1 must return 5 rows");
+    assert!(
+        page1.total_matching_rows >= 30,
+        "total_matching_rows ({}) must reflect all matches, not be capped by limit",
+        page1.total_matching_rows
+    );
+
+    // Page 2: offset=5, limit=5 (simulating infinite scroll)
+    let page2 = executor
+        .execute(&query, 5, 5, Some((page1.time_start, page1.time_end)))
+        .unwrap();
+    assert_eq!(page2.rows.len(), 5, "page 2 must return 5 rows");
+    assert!(
+        page2.total_matching_rows >= 30,
+        "total_matching_rows ({}) must still reflect all matches on page 2",
+        page2.total_matching_rows
+    );
+
+    // Verify page 2 rows are different from page 1
+    let bytes_idx = page1
+        .columns
+        .iter()
+        .position(|c| c == "octetDeltaCount")
+        .expect("octetDeltaCount column");
+    let page1_bytes: Vec<u64> = page1
+        .rows
+        .iter()
+        .map(|r| r[bytes_idx].as_u64().unwrap())
+        .collect();
+    let page2_bytes: Vec<u64> = page2
+        .rows
+        .iter()
+        .map(|r| r[bytes_idx].as_u64().unwrap())
+        .collect();
+    assert_ne!(
+        page1_bytes, page2_bytes,
+        "page 2 must have different rows than page 1"
+    );
+
     cleanup(&dir);
 }

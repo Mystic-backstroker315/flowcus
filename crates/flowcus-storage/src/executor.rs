@@ -1820,14 +1820,30 @@ impl QueryExecutor {
             filter_col_names.push("flowcusExportTime".to_string());
         }
 
-        // Step 7: Process parts with columnar filtering
+        // Step 7: Build unified column list across all parts in the time range.
+        // This must happen before processing so that every part's rows use the
+        // same column ordering — otherwise rows from parts with different schemas
+        // would be misaligned when concatenated.
+        let mut all_schema_columns: Vec<String> = Vec::new();
+        for pe in &filtered_parts {
+            if pe.path.join(".merging").exists() {
+                continue;
+            }
+            if let Ok(cols) = part::list_columns(&pe.path) {
+                for col in cols {
+                    if !all_schema_columns.contains(&col) {
+                        all_schema_columns.push(col);
+                    }
+                }
+            }
+        }
+
+        // Step 8: Process parts with columnar filtering
         let mut all_rows: Vec<Vec<serde_json::Value>> = Vec::new();
         let mut total_rows_scanned: u64 = 0;
         let mut total_matching_rows: u64 = 0;
         let mut parts_skipped_by_index: usize = 0;
         let mut parts_skipped_by_merge: usize = 0;
-        // Collect all column names from schemas for select-all mode
-        let mut all_schema_columns: Vec<String> = Vec::new();
         // For aggregate queries, we accumulate column buffers + matching indices
         // instead of building JSON rows eagerly
         let mut agg_matching_indices: Vec<(usize, u32)> = Vec::new(); // (part_idx, row_idx)
@@ -1859,7 +1875,8 @@ impl QueryExecutor {
 
         // Helper: process one part, handling errors inline
         let process_one_part = |part_entry: &PartEntry,
-                                local_plan: &mut ExecutionPlan|
+                                local_plan: &mut ExecutionPlan,
+                                remaining_rows: Option<usize>|
          -> std::io::Result<ProcessPartResult> {
             if part_entry.path.join(".merging").exists() {
                 local_plan.steps.push(PlanStep::PartSkippedMerging {
@@ -1876,6 +1893,8 @@ impl QueryExecutor {
                 &filter_col_names,
                 needs_all_columns,
                 is_aggregate,
+                &all_schema_columns,
+                remaining_rows,
                 local_plan,
             ) {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1922,30 +1941,20 @@ impl QueryExecutor {
                     ProcessPartResult::Rows {
                         rows,
                         rows_scanned,
-                        output_col_names,
+                        total_matching,
                     } => {
                         total_rows_scanned += rows_scanned;
-                        total_matching_rows += rows.len() as u64;
-                        for col in &output_col_names {
-                            if !all_schema_columns.contains(col) {
-                                all_schema_columns.push(col.clone());
-                            }
-                        }
+                        total_matching_rows += total_matching;
                         all_rows.extend(rows);
                     }
                     ProcessPartResult::ColumnarData {
                         columns: part_cols,
                         matching_indices,
                         rows_scanned,
-                        output_col_names,
+                        ..
                     } => {
                         total_rows_scanned += rows_scanned;
                         total_matching_rows += matching_indices.len() as u64;
-                        for col in &output_col_names {
-                            if !all_schema_columns.contains(col) {
-                                all_schema_columns.push(col.clone());
-                            }
-                        }
                         let part_idx = agg_part_columns.len();
                         agg_part_columns.push(part_cols);
                         for idx in matching_indices {
@@ -1978,7 +1987,7 @@ impl QueryExecutor {
                 .map(|part_entry| {
                     let part_start = Instant::now();
                     let mut local_plan = ExecutionPlan::default();
-                    let result = process_one_part(part_entry, &mut local_plan)
+                    let result = process_one_part(part_entry, &mut local_plan, None)
                         .unwrap_or(ProcessPartResult::SkippedMerge);
                     let dur = u64::try_from(part_start.elapsed().as_micros()).ok();
                     let path = part_entry
@@ -2004,8 +2013,10 @@ impl QueryExecutor {
             for par in &par_results {
                 let (rows_scanned, rows_matched) = match &par.result {
                     ProcessPartResult::Rows {
-                        rows, rows_scanned, ..
-                    } => (*rows_scanned, rows.len() as u64),
+                        total_matching,
+                        rows_scanned,
+                        ..
+                    } => (*rows_scanned, *total_matching),
                     ProcessPartResult::ColumnarData {
                         matching_indices,
                         rows_scanned,
@@ -2038,7 +2049,8 @@ impl QueryExecutor {
             for part_entry in &filtered_parts {
                 let part_start = Instant::now();
                 let mut local_plan = ExecutionPlan::default();
-                let result = process_one_part(part_entry, &mut local_plan);
+                let remaining = (needed_rows as usize).saturating_sub(all_rows.len());
+                let result = process_one_part(part_entry, &mut local_plan, Some(remaining));
                 let part_dur = u64::try_from(part_start.elapsed().as_micros()).ok();
                 let path = part_entry
                     .path
@@ -2133,11 +2145,15 @@ impl QueryExecutor {
                 total_matching_rows = total_matching_rows.min(lim);
             }
 
-            // Map rows from part-schema column order to output column order
-            let mapped_rows =
-                self.map_rows_to_output(&all_rows, &all_schema_columns, &output_columns);
-
-            (output_columns.clone(), mapped_rows)
+            // Map rows from unified column order to output column order.
+            // Skip the remap when columns already match (common case).
+            if output_columns == all_schema_columns {
+                (output_columns.clone(), all_rows)
+            } else {
+                let mapped_rows =
+                    self.map_rows_to_output(&all_rows, &all_schema_columns, &output_columns);
+                (output_columns.clone(), mapped_rows)
+            }
         };
 
         let agg_us = u64::try_from(agg_start.elapsed().as_micros()).ok();
@@ -2150,13 +2166,6 @@ impl QueryExecutor {
                 duration_us: agg_us,
             });
         }
-
-        plan.steps.push(PlanStep::FilterApply {
-            expression: format!("{} filter(s)", ast_filters.len()),
-            rows_before: total_rows_scanned as usize,
-            rows_after: total_matching_rows as usize,
-            duration_us: None, // filter timing is per-part in process_part_columnar
-        });
 
         // Step 10: Apply pagination (offset/limit) to the result
         let total_result_rows = result_rows.len() as u64;
@@ -3708,11 +3717,13 @@ enum ProcessPartResult {
     Skipped,
     /// Skipped due to merge race (not found, .merging marker, etc.)
     SkippedMerge,
-    /// Non-aggregate: rows already converted to JSON, in schema column order.
+    /// Non-aggregate: rows in unified column order. `total_matching` is the
+    /// full count of filter-matching rows in the part (may exceed `rows.len()`
+    /// when a row budget caps materialization for early termination).
     Rows {
         rows: Vec<Vec<serde_json::Value>>,
         rows_scanned: u64,
-        output_col_names: Vec<String>,
+        total_matching: u64,
     },
     /// Aggregate: keep column buffers + matching row indices to avoid
     /// premature JSON conversion. The aggregation engine operates on
@@ -3721,7 +3732,6 @@ enum ProcessPartResult {
         columns: HashMap<String, ColumnBuffer>,
         matching_indices: Vec<u32>,
         rows_scanned: u64,
-        output_col_names: Vec<String>,
     },
 }
 
@@ -3744,6 +3754,8 @@ impl QueryExecutor {
         filter_col_names: &[String],
         needs_all_columns: bool,
         is_aggregate: bool,
+        unified_columns: &[String],
+        remaining_rows: Option<usize>,
         plan: &mut ExecutionPlan,
     ) -> std::io::Result<ProcessPartResult> {
         let part_dir = &part_entry.path;
@@ -4196,16 +4208,20 @@ impl QueryExecutor {
                 columns: decoded,
                 matching_indices,
                 rows_scanned: row_count as u64,
-                output_col_names,
             });
         }
 
-        // Build Vec<Vec<Value>> directly from column buffers at matching indices.
-        // Column order matches output_col_names — no HashMap involved.
-        let rows: Vec<Vec<serde_json::Value>> = matching_indices
+        // Build Vec<Vec<Value>> in unified column order so rows from different
+        // parts are aligned. Columns not present in this part produce Null.
+        // Only materialize up to `remaining_rows` to avoid wasting resources,
+        // but report `total_matching` for accurate pagination.
+        let total_matching = matching_indices.len() as u64;
+        let row_budget = remaining_rows.unwrap_or(usize::MAX);
+        let materialize_count = matching_indices.len().min(row_budget);
+        let rows: Vec<Vec<serde_json::Value>> = matching_indices[..materialize_count]
             .iter()
             .map(|&idx| {
-                output_col_names
+                unified_columns
                     .iter()
                     .map(|name| match decoded.get(name) {
                         Some(buf) => column_to_json(buf, idx as usize, name),
@@ -4218,7 +4234,7 @@ impl QueryExecutor {
         Ok(ProcessPartResult::Rows {
             rows,
             rows_scanned: row_count as u64,
-            output_col_names,
+            total_matching,
         })
     }
 }
@@ -4371,6 +4387,8 @@ mod tests {
             &[],
             false,
             false,
+            &[],
+            None,
             &mut plan,
         );
         assert!(matches!(result, Ok(ProcessPartResult::Skipped)));
