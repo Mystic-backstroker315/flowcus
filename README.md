@@ -9,10 +9,9 @@ Collects NetFlow (RFC 3954) v5/v9 and IPFIX (RFC 7011) over UDP/TCP, stores flow
 ## Features
 
 - **NetFlow v5/v9 + IPFIX collection** — UDP and TCP listeners, 200+ IANA IEs + 9 vendor registries (Cisco, Juniper, Palo Alto, VMware, Fortinet, ntop, Nokia, Huawei, Barracuda)
-- **Columnar storage** — Time-partitioned, generation-based merge compaction, automatic codec selection (Delta, DeltaDelta, GCD + LZ4), CRC32-C integrity on all formats
+- **Columnar storage** — Time-partitioned, generation-based merge compaction, automatic codec selection (Delta, DeltaDelta, GCD), CRC32-C integrity on all formats, ZSTD compressed
 - **Query engine** — FQL query language with typed AST, bloom filter point lookups, granule mark seeking
 - **Embedded web UI** — React frontend compiled into the binary, no separate web server needed
-- **Observability** — Prometheus metrics at `/observability/metrics`, structured JSON logging
 - **Single binary** — All components embedded, deploy by copying one file
 
 ## Quick Start
