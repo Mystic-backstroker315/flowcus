@@ -373,8 +373,9 @@ fn is_ip_field(field: &str) -> bool {
         || field.contains("IPv6Address")
         || field.contains("Ipv4Address")
         || field.contains("Ipv6Address")
-        || field.contains("IPv4Prefix")
-        || field.contains("IPv6Prefix")
+        // ends_with to avoid matching *PrefixLength (u8 numeric fields)
+        || field.ends_with("IPv4Prefix")
+        || field.ends_with("IPv6Prefix")
 }
 
 fn is_port_field(field: &str) -> bool {
@@ -383,6 +384,22 @@ fn is_port_field(field: &str) -> bool {
 
 fn is_proto_field(field: &str) -> bool {
     PROTO_FIELDS.contains(&field)
+}
+
+/// MAC address fields — must be routed to string filter, not numeric.
+const MAC_FIELDS: &[&str] = &[
+    "sourceMacAddress",
+    "destinationMacAddress",
+    "postSourceMacAddress",
+    "postDestinationMacAddress",
+    "src_mac",
+    "srcmac",
+    "dst_mac",
+    "dstmac",
+];
+
+fn is_mac_field(field: &str) -> bool {
+    MAC_FIELDS.contains(&field) || field.contains("MacAddress")
 }
 
 /// Determine `IpDirection` from a field name.
@@ -452,6 +469,11 @@ fn convert_single_filter(filter: &Filter) -> Result<ast::FilterExpr, String> {
         convert_port_filter(filter)?
     } else if is_proto_field(&filter.field) {
         convert_proto_filter(filter)?
+    } else if is_mac_field(&filter.field) {
+        // MAC fields must go through string comparison (not numeric), since
+        // addresses like "48:a9:8a:ef:61:22" would otherwise be misinterpreted
+        // by parse_suffixed_number as the integer 48.
+        convert_string_filter(filter)?
     } else if is_string_op(&filter.op) {
         convert_string_filter(filter)?
     } else if is_ip_op(&filter.op) {
@@ -1557,6 +1579,14 @@ mod tests {
         assert!(is_ip_field("customIPv6Address"));
         assert!(!is_ip_field("octetDeltaCount"));
         assert!(!is_ip_field("sourceTransportPort"));
+        // PrefixLength fields are numeric (U8), NOT IP addresses
+        assert!(!is_ip_field("sourceIPv4PrefixLength"));
+        assert!(!is_ip_field("destinationIPv4PrefixLength"));
+        assert!(!is_ip_field("sourceIPv6PrefixLength"));
+        assert!(!is_ip_field("destinationIPv6PrefixLength"));
+        // But actual prefix fields (IP addresses) should be detected
+        assert!(is_ip_field("sourceIPv4Prefix"));
+        assert!(is_ip_field("destinationIPv4Prefix"));
     }
 
     #[test]
@@ -1638,5 +1668,44 @@ mod tests {
             }
             other => panic!("expected IP filter, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn to_ast_mac_filter_routes_to_string_filter() {
+        let sq = StructuredQuery {
+            time_range: StructuredTimeRange::Relative {
+                duration: "1h".to_string(),
+            },
+            filters: vec![Filter {
+                field: "destinationMacAddress".to_string(),
+                op: FilterOp::Eq,
+                value: serde_json::json!("48:a9:8a:ef:61:22"),
+                negated: false,
+            }],
+            logic: FilterLogic::And,
+            columns: None,
+            aggregate: None,
+            sort: None,
+        };
+        let q = sq.to_ast().unwrap();
+        match &q.stages[0] {
+            ast::Stage::Filter(ast::FilterExpr::StringFilter(sf)) => {
+                assert_eq!(sf.field, "destinationMacAddress");
+                assert_eq!(sf.op, ast::StringOp::Eq);
+                assert_eq!(sf.value, "48:a9:8a:ef:61:22");
+            }
+            other => panic!("expected StringFilter for MAC, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn is_mac_field_detection() {
+        assert!(is_mac_field("sourceMacAddress"));
+        assert!(is_mac_field("destinationMacAddress"));
+        assert!(is_mac_field("postSourceMacAddress"));
+        assert!(is_mac_field("postDestinationMacAddress"));
+        assert!(is_mac_field("src_mac"));
+        assert!(!is_mac_field("sourceIPv4Address"));
+        assert!(!is_mac_field("sourceTransportPort"));
     }
 }

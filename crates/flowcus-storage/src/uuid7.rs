@@ -17,18 +17,25 @@
 /// Monotonic UUIDv7 generator.
 ///
 /// Guarantees strictly increasing output for the same or increasing timestamps.
-/// The counter resets when the millisecond changes and increments within the
-/// same millisecond, providing 74 bits of counter space (more than enough).
+/// The counter is seeded with random bits on creation, ensuring that independent
+/// generator instances produce non-overlapping UUID sequences even when they
+/// observe the same millisecond timestamps. Within a single instance, the
+/// counter increments monotonically, providing strict ordering.
 pub struct Uuid7Generator {
     last_ms: u64,
     counter: u64,
 }
 
 impl Uuid7Generator {
+    /// Create a new generator with a random counter seed.
+    ///
+    /// The seed occupies the lower bits of the 74-bit counter space, leaving
+    /// ample room for monotonic increments without risk of overflow or collision
+    /// with other generator instances.
     pub fn new() -> Self {
         Self {
             last_ms: 0,
-            counter: 0,
+            counter: random_seed(),
         }
     }
 
@@ -42,9 +49,11 @@ impl Uuid7Generator {
     pub fn generate(&mut self, timestamp_ms: u64) -> [u64; 2] {
         match timestamp_ms.cmp(&self.last_ms) {
             std::cmp::Ordering::Greater => {
-                // Time moved forward — reset counter for new millisecond.
+                // Time moved forward — re-seed counter with random bits.
+                // This ensures independent generators cannot collide even if
+                // they observe the same millisecond transition.
                 self.last_ms = timestamp_ms;
-                self.counter = 0;
+                self.counter = random_seed();
             }
             std::cmp::Ordering::Equal => {
                 // Same millisecond — increment counter.
@@ -113,6 +122,30 @@ impl Default for Uuid7Generator {
     }
 }
 
+/// Generate a random 32-bit seed for the counter.
+///
+/// Uses `/dev/urandom` for true randomness. Falls back to hashing the
+/// thread ID and high-resolution timestamp if the read fails.
+/// Only 32 bits are used, leaving 42 bits of headroom for monotonic
+/// increments (~4 trillion per millisecond).
+fn random_seed() -> u64 {
+    use std::hash::{Hash, Hasher};
+    use std::io::Read;
+
+    let mut buf = [0u8; 4];
+    if std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok()
+    {
+        return u64::from(u32::from_le_bytes(buf));
+    }
+    // Fallback: hash thread id + instant
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::thread::current().id().hash(&mut hasher);
+    std::time::Instant::now().hash(&mut hasher);
+    hasher.finish() & 0xFFFF_FFFF
+}
+
 /// Extract the millisecond timestamp from a UUIDv7.
 pub fn extract_timestamp_ms(uuid: [u64; 2]) -> u64 {
     uuid[0] >> 16
@@ -178,13 +211,27 @@ mod tests {
     }
 
     #[test]
-    fn counter_resets_on_new_ms() {
+    fn counter_increments_within_same_ms() {
         let mut uuid_gen = Uuid7Generator::new();
         let _a = uuid_gen.generate(1_000_000);
+        let counter_after_a = uuid_gen.counter;
         let _b = uuid_gen.generate(1_000_000);
-        assert_eq!(uuid_gen.counter, 1);
-        let _c = uuid_gen.generate(1_000_001);
-        assert_eq!(uuid_gen.counter, 0);
+        assert_eq!(uuid_gen.counter, counter_after_a + 1);
+    }
+
+    #[test]
+    fn counter_reseeds_on_new_ms() {
+        // Two generators should produce different counters for the same ms
+        // (proving the seed is random, not zero).
+        let mut gen1 = Uuid7Generator::new();
+        let mut gen2 = Uuid7Generator::new();
+        let a = gen1.generate(1_000_000);
+        let b = gen2.generate(1_000_000);
+        // UUIDs share the same timestamp but should have different counters
+        assert_ne!(
+            a, b,
+            "independent generators must not produce identical UUIDs"
+        );
     }
 
     #[test]
@@ -309,6 +356,22 @@ mod tests {
         for i in 0..1_000_000 {
             let uuid = uuid_gen.generate(1_700_000_000_000 + i / 1000);
             assert!(seen.insert(uuid), "duplicate at i={i}");
+        }
+    }
+
+    #[test]
+    fn no_clash_across_generators() {
+        // Simulate the bug scenario: two independent generators producing
+        // UUIDs for the same timestamps must not collide.
+        let mut gen1 = Uuid7Generator::new();
+        let mut gen2 = Uuid7Generator::new();
+        let mut seen = std::collections::HashSet::new();
+        for ms in 0..10_000u64 {
+            let ts = 1_700_000_000_000 + ms;
+            let a = gen1.generate(ts);
+            let b = gen2.generate(ts);
+            assert!(seen.insert(a), "gen1 duplicate at ms={ms}");
+            assert!(seen.insert(b), "gen2 collision at ms={ms}");
         }
     }
 

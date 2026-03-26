@@ -865,6 +865,16 @@ fn column_get_u128(buf: &ColumnBuffer, row: usize) -> [u64; 2] {
     }
 }
 
+/// Normalize a MAC address string to 12-char lowercase hex (no separators).
+/// Handles colons, dashes, dots, and bare hex: `AA:BB:CC:DD:EE:FF`,
+/// `AA-BB-CC-DD-EE-FF`, `aabb.ccdd.eeff`, `aabbccddeeff`.
+fn normalize_mac(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
 fn column_get_varlen<'a>(buf: &'a ColumnBuffer, row: usize) -> &'a [u8] {
     if let ColumnBuffer::VarLen { offsets, data } = buf {
         if row + 1 < offsets.len() {
@@ -1105,19 +1115,26 @@ fn eval_resolved_string(
         Some(b) => b,
         None => return false,
     };
-    // MAC columns need formatting to string for comparison
+    // MAC columns: normalize both sides to bare lowercase hex for comparison.
+    // Accepts any common notation: aa:bb:cc:dd:ee:ff, AA-BB-CC-DD-EE-FF,
+    // aabb.ccdd.eeff, aabbccddeeff.
     if let ColumnBuffer::Mac(v) = buf {
         let mac = v.get(row).copied().unwrap_or([0; 6]);
-        let formatted = format!(
-            "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        let col_hex = format!(
+            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
         );
-        let val_lower = sf.value.to_lowercase();
+        let filter_hex = normalize_mac(&sf.value);
         return match sf.op {
-            StringOp::Eq => formatted == val_lower,
-            StringOp::Ne => formatted != val_lower,
+            StringOp::Eq => col_hex == filter_hex,
+            StringOp::Ne => col_hex != filter_hex,
             StringOp::Regex | StringOp::NotRegex => {
-                let matched = formatted.contains(val_lower.as_str());
+                // For regex/contains on MAC, compare canonical colon form
+                let canonical = format!(
+                    "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                    mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+                );
+                let matched = canonical.contains(&sf.value.to_lowercase());
                 if sf.op == StringOp::NotRegex {
                     !matched
                 } else {
@@ -1128,7 +1145,7 @@ fn eval_resolved_string(
                 let matched = sf
                     .list_items
                     .iter()
-                    .any(|item| formatted == item.to_lowercase());
+                    .any(|item| col_hex == normalize_mac(item));
                 if sf.op == StringOp::NotIn {
                     !matched
                 } else {
@@ -1668,9 +1685,31 @@ pub fn bloom_lookup_bytes(filter: &FilterExpr) -> Vec<(String, Vec<u8>)> {
             // match — so we can't skip. Drop through.
             let _ = inner;
         }
+        // String equality on MAC columns: parse the MAC string to raw bytes
+        // for bloom lookup. Bloom was built with 6-byte raw MAC values.
+        FilterExpr::StringFilter(sf) if sf.op == StringOp::Eq => {
+            let col_name = resolve_field_name(&sf.field).to_string();
+            if let Some(bytes) = parse_mac_bytes(&sf.value) {
+                result.push((col_name, bytes.to_vec()));
+            }
+        }
         _ => {}
     }
     result
+}
+
+/// Parse a MAC address string in any common notation to 6 raw bytes.
+/// Returns `None` if the string doesn't look like a valid MAC address.
+fn parse_mac_bytes(s: &str) -> Option<[u8; 6]> {
+    let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() != 12 {
+        return None;
+    }
+    let mut bytes = [0u8; 6];
+    for (i, byte) in bytes.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(bytes)
 }
 
 /// Extract bloom lookup values for list-style filters (IP list, port list).
@@ -3925,6 +3964,19 @@ impl QueryExecutor {
         let mrk_path = pe.path.join("columns/flowcusExportTime.mrk");
         let marks_result = self.cache.get_marks(&mrk_path);
 
+        // Read schema to get column storage types for bloom truncation.
+        let col_types: HashMap<String, StorageType> = {
+            let schema_path = pe.path.join("schema.bin");
+            match part::read_schema_bin(&schema_path) {
+                Ok(s) => s
+                    .columns
+                    .into_iter()
+                    .map(|c| (c.name, c.storage_type))
+                    .collect(),
+                Err(_) => HashMap::new(),
+            }
+        };
+
         match marks_result {
             Ok((_granule_size, ref marks, _cached)) if !marks.is_empty() => {
                 // Build per-granule bloom mask if bloom lookups are requested.
@@ -3938,10 +3990,18 @@ impl QueryExecutor {
                             Ok((_bits, blooms, _cached)) => blooms,
                             Err(_) => continue,
                         };
+                        let col_st = col_types
+                            .get(col_name.as_str())
+                            .copied()
+                            .unwrap_or(StorageType::U32);
+                        let effective_bytes: &[u8] = match col_st.element_size() {
+                            Some(n) if n < value_bytes.len() => &value_bytes[..n],
+                            _ => value_bytes,
+                        };
                         for (i, masked) in mask.iter_mut().enumerate() {
                             if *masked {
                                 if let Some(bloom) = blooms.get(i) {
-                                    if !bloom.may_contain(value_bytes) {
+                                    if !bloom.may_contain(effective_bytes) {
                                         *masked = false;
                                     }
                                 }
@@ -5548,26 +5608,81 @@ mod tests {
     }
 
     #[test]
-    fn test_mac_address_case_insensitive() {
-        let filter = resolve_string_filter(&StringFilterExpr {
-            field: "sourceMacAddress".to_string(),
-            op: StringOp::Eq,
-            value: "AA:BB:CC:DD:EE:FF".to_string(),
-        });
-        let mut columns = HashMap::new();
-        let mut col = ColumnBuffer::new(StorageType::Mac);
-        if let ColumnBuffer::Mac(ref mut v) = col {
-            v.push([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
-        }
-        columns.insert("sourceMacAddress".to_string(), col);
+    fn test_mac_address_all_notations() {
+        let mac_bytes = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let notations = [
+            "aa:bb:cc:dd:ee:ff", // lowercase colons
+            "AA:BB:CC:DD:EE:FF", // uppercase colons
+            "AA-BB-CC-DD-EE-FF", // Windows dashes
+            "aabb.ccdd.eeff",    // Cisco dots
+            "AABB.CCDD.EEFF",    // Cisco dots uppercase
+            "aabbccddeeff",      // bare hex
+            "AABBCCDDEEFF",      // bare hex uppercase
+        ];
+        for notation in &notations {
+            let filter = resolve_string_filter(&StringFilterExpr {
+                field: "sourceMacAddress".to_string(),
+                op: StringOp::Eq,
+                value: notation.to_string(),
+            });
+            let mut columns = HashMap::new();
+            let mut col = ColumnBuffer::new(StorageType::Mac);
+            if let ColumnBuffer::Mac(ref mut v) = col {
+                v.push(mac_bytes);
+                v.push([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]); // non-matching
+            }
+            columns.insert("sourceMacAddress".to_string(), col);
 
-        let resolved = ResolvedFilter::StringFilter(filter);
-        assert!(evaluate_resolved_filter(&resolved, 0, &columns));
+            let resolved = ResolvedFilter::StringFilter(filter);
+            assert!(
+                evaluate_resolved_filter(&resolved, 0, &columns),
+                "MAC notation {notation} should match"
+            );
+            assert!(
+                !evaluate_resolved_filter(&resolved, 1, &columns),
+                "MAC notation {notation} should NOT match different MAC"
+            );
+        }
     }
 
     // -----------------------------------------------------------------------
     // IPv6 prefix mask helper
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_mac_bytes() {
+        assert_eq!(
+            parse_mac_bytes("48:a9:8a:ef:61:22"),
+            Some([0x48, 0xa9, 0x8a, 0xef, 0x61, 0x22])
+        );
+        assert_eq!(
+            parse_mac_bytes("48-A9-8A-EF-61-22"),
+            Some([0x48, 0xa9, 0x8a, 0xef, 0x61, 0x22])
+        );
+        assert_eq!(
+            parse_mac_bytes("48a9.8aef.6122"),
+            Some([0x48, 0xa9, 0x8a, 0xef, 0x61, 0x22])
+        );
+        assert_eq!(
+            parse_mac_bytes("48a98aef6122"),
+            Some([0x48, 0xa9, 0x8a, 0xef, 0x61, 0x22])
+        );
+        assert_eq!(parse_mac_bytes("not-a-mac"), None);
+        assert_eq!(parse_mac_bytes("48:a9:8a"), None); // too short
+    }
+
+    #[test]
+    fn test_mac_bloom_lookup_bytes() {
+        let filter = FilterExpr::StringFilter(StringFilterExpr {
+            field: "destinationMacAddress".to_string(),
+            op: StringOp::Eq,
+            value: "48:a9:8a:ef:61:22".to_string(),
+        });
+        let lookups = bloom_lookup_bytes(&filter);
+        assert_eq!(lookups.len(), 1);
+        assert_eq!(lookups[0].0, "destinationMacAddress");
+        assert_eq!(lookups[0].1, vec![0x48, 0xa9, 0x8a, 0xef, 0x61, 0x22]);
+    }
 
     #[test]
     fn test_ipv6_prefix_mask() {
