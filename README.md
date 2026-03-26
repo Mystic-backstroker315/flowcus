@@ -1,6 +1,6 @@
 # Flowcus
 
-High-performance IPFIX flow collector with columnar storage and built-in query engine. Single binary, zero external dependencies.
+High-performance NetFlow/IPFIX flow collector with columnar storage and built-in query engine. Single binary, zero external dependencies.
 
 ![Flowcus](screenshot.png)
 
