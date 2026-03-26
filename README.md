@@ -4,11 +4,11 @@ High-performance IPFIX flow collector with columnar storage and built-in query e
 
 ![Flowcus](screenshot.png)
 
-Collects NetFlow/IPFIX (RFC 7011) over UDP/TCP, stores flows in a compressed columnar format with automatic compaction, and serves a web UI for real-time analysis.
+Collects NetFlow (RFC 3954) v5/v9 and IPFIX (RFC 7011) over UDP/TCP, stores flows in a compressed columnar format with automatic compaction, and serves a web UI for real-time analysis.
 
 ## Features
 
-- **IPFIX/NetFlow collection** — UDP and TCP listeners, ~170 IANA IEs + 9 vendor registries (Cisco, Juniper, Palo Alto, VMware, Fortinet, ntop, Nokia, Huawei, Barracuda)
+- **NetFlow v5/v9 + IPFIX collection** — UDP and TCP listeners, 200+ IANA IEs + 9 vendor registries (Cisco, Juniper, Palo Alto, VMware, Fortinet, ntop, Nokia, Huawei, Barracuda)
 - **Columnar storage** — Time-partitioned, generation-based merge compaction, automatic codec selection (Delta, DeltaDelta, GCD + LZ4), CRC32-C integrity on all formats
 - **Query engine** — FQL query language with typed AST, bloom filter point lookups, granule mark seeking
 - **Embedded web UI** — React frontend compiled into the binary, no separate web server needed
@@ -64,6 +64,9 @@ docker run -d \
 Settings file at `{storage_dir}/flowcus.settings` (auto-created on first run):
 
 ```toml
+[logging]
+format = "human"              # or "json"
+
 [server]
 host = "0.0.0.0"
 port = 2137
@@ -75,14 +78,19 @@ tcp = false
 
 [storage]
 dir = "storage"
-retention_hours = 744        # 31 days, 0 = unlimited
+retention_hours = 744         # 31 days, 0 = unlimited
 merge_workers = 4
+flush_interval_secs = 5
 ```
 
 All settings are overridable via CLI flags or environment variables:
 
 ```bash
 flowcus --port 8080 --storage /var/lib/flowcus
+flowcus --settings /etc/flowcus.settings
+flowcus --log-format json
+
+# Environment variables
 FLOWCUS_PORT=8080 FLOWCUS_STORAGE=/var/lib/flowcus flowcus
 ```
 
