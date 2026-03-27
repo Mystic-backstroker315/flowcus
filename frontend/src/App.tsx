@@ -680,9 +680,7 @@ export function App() {
               </svg>
             </button>
             <span className="stats-summary">
-              {stats.rows_returned.toLocaleString()} rows
-              {stats.total_rows > 0 && ` out of ${stats.total_rows.toLocaleString()}`}
-              {' in '}{formatMicros(stats.execution_time_us)}
+              {stats.rows_returned.toLocaleString()} rows in {formatMicros(stats.execution_time_us)}
               {stats.cached ? ' (cached)' : ''}
             </span>
           </div>

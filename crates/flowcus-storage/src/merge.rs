@@ -430,7 +430,6 @@ fn scan_and_enqueue(
 ) {
     let dirty_hours = pending.get_dirty();
     if dirty_hours.is_empty() {
-        metrics.merge_unmerged_parts.store(0, Ordering::Relaxed);
         return;
     }
 
@@ -439,7 +438,6 @@ fn scan_and_enqueue(
         "Scanning pending hours for merge candidates"
     );
 
-    let mut total_unmerged: i64 = 0;
     let mut q = queue.lock().unwrap();
 
     for hour_dir in &dirty_hours {
@@ -449,20 +447,6 @@ fn scan_and_enqueue(
             continue;
         }
         if q.active.contains_key(hour_dir) {
-            // Count parts in active hours for the unmerged metric
-            if let Ok(entries) = std::fs::read_dir(hour_dir) {
-                let count = entries
-                    .flatten()
-                    .filter(|e| {
-                        e.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
-                            && e.file_name()
-                                .to_str()
-                                .and_then(crate::part::parse_part_dir_name_versioned)
-                                .is_some()
-                    })
-                    .count();
-                total_unmerged += count as i64;
-            }
             continue;
         }
 
@@ -479,8 +463,6 @@ fn scan_and_enqueue(
                 continue;
             }
         };
-
-        total_unmerged += parts.len() as i64;
 
         // Fewer than min_parts → seal this hour (nothing to merge yet)
         if parts.len() < min_parts {
@@ -536,10 +518,6 @@ fn scan_and_enqueue(
             }
         }
     }
-
-    metrics
-        .merge_unmerged_parts
-        .store(total_unmerged, Ordering::Relaxed);
 }
 
 /// Discover valid, non-active parts in an hour directory.

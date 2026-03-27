@@ -210,7 +210,7 @@ export function HealthPanel({ open, onClose }: HealthPanelProps) {
                 <StatCard label="Rows Merged" value={formatNumber(m.merge_rows_processed ?? 0)} sub={formatBytes(m.merge_bytes_written ?? 0)} />
                 <StatCard label="Active Jobs" value={String(m.merge_queue_active ?? 0)} sub={`${m.merge_active_workers ?? 0} threads`} />
                 <StatCard label="Queue" value={String(m.merge_queue_pending ?? 0)} sub={`${m.merge_pending_hours ?? 0} dirty hours`} />
-                <StatCard label="Unmerged Parts" value={formatNumber(m.merge_unmerged_parts ?? 0)} />
+
                 <StatCard label="Hours Sealed" value={formatNumber(m.merge_queue_sealed ?? 0)} />
                 <StatCard label="Parts Removed" value={formatNumber(m.merge_parts_removed ?? 0)} />
                 <StatCard label="Columns Processed" value={formatNumber(m.merge_columns_processed ?? 0)} />

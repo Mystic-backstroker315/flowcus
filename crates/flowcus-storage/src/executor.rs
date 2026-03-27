@@ -1999,6 +1999,8 @@ impl QueryExecutor {
         deduplicate_parts(&mut filtered_parts, &mut plan);
 
         // Compute total rows in range from part metadata (no column reads).
+        // This is a rough estimate — the histogram endpoint provides a more
+        // accurate count using granule-level marks.
         let total_rows_in_range: u64 = {
             let mut sum = 0u64;
             for pe in &filtered_parts {
@@ -2414,11 +2416,25 @@ impl QueryExecutor {
                 let time_col_idx = all_schema_columns
                     .iter()
                     .position(|c| c == "flowcusExportTime");
+                let row_id_col_idx = all_schema_columns.iter().position(|c| c == "flowcusRowId");
                 if let Some(idx) = time_col_idx {
                     all_rows.sort_by(|a, b| {
                         let va = a.get(idx).and_then(|v| v.as_u64()).unwrap_or(0);
                         let vb = b.get(idx).and_then(|v| v.as_u64()).unwrap_or(0);
-                        vb.cmp(&va) // descending
+                        vb.cmp(&va).then_with(|| {
+                            // Tiebreak by flowcusRowId desc so that the cursor
+                            // filter (flowcusRowId < cursor) correctly partitions
+                            // same-timestamp rows across pages.
+                            let ra = row_id_col_idx
+                                .and_then(|i| a.get(i))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let rb = row_id_col_idx
+                                .and_then(|i| b.get(i))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            rb.cmp(ra)
+                        })
                     });
                 }
             }
@@ -4679,9 +4695,26 @@ impl QueryExecutor {
         // Only materialize up to `remaining_rows` to avoid wasting resources,
         // but report `total_matching` for accurate pagination.
         let total_matching = matching_indices.len() as u64;
+        // When truncating to remaining_rows, sort matching indices by
+        // (flowcusExportTime desc, flowcusRowId desc) first so we keep the
+        // NEWEST rows.  This matches the global sort order and ensures the
+        // cursor boundary is correct for subsequent pages.
         let row_budget = remaining_rows.unwrap_or(usize::MAX);
-        let materialize_count = matching_indices.len().min(row_budget);
-        let rows: Vec<Vec<serde_json::Value>> = matching_indices[..materialize_count]
+        if matching_indices.len() > row_budget {
+            let time_buf = decoded.get("flowcusExportTime");
+            let rowid_buf = decoded.get("flowcusRowId");
+            matching_indices.sort_unstable_by(|&a, &b| {
+                let ta = time_buf.map_or(0, |buf| column_get_u64(buf, a as usize));
+                let tb = time_buf.map_or(0, |buf| column_get_u64(buf, b as usize));
+                tb.cmp(&ta).then_with(|| {
+                    let ra = rowid_buf.map_or([0u64; 2], |buf| column_get_u128(buf, a as usize));
+                    let rb = rowid_buf.map_or([0u64; 2], |buf| column_get_u128(buf, b as usize));
+                    rb.cmp(&ra)
+                })
+            });
+            matching_indices.truncate(row_budget);
+        }
+        let rows: Vec<Vec<serde_json::Value>> = matching_indices[..matching_indices.len()]
             .iter()
             .map(|&idx| {
                 unified_columns

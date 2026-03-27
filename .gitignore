@@ -23,8 +23,8 @@ Thumbs.db
 .env.local
 .env.*.local
 
-# Claude knowledge (auto-generated, track selectively)
-.claude/knowledge/**/*.auto.md
+# Claude
+.claude/
 
 # Storage data (dev)
 /storage/

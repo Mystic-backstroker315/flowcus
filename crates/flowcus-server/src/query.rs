@@ -385,45 +385,49 @@ async fn execute_query(
         .load(std::sync::atomic::Ordering::Acquire);
     let current_flush_count = flush_count.wrapping_add(merge_count);
 
-    if let Some(cached) = state.query_cache().get(cache_key, current_flush_count) {
-        debug!("Query cache hit");
-        state
-            .metrics()
-            .query_cache_hits
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let columns = resolve_column_types(&cached.columns);
-        let response = QueryResponse {
-            parsed: parsed_json,
-            columns,
-            rows: cached.rows,
-            stats: QueryStats {
-                parse_time_us: u64::try_from(parse_time.as_micros()).unwrap_or(u64::MAX),
-                execution_time_us: 0,
-                rows_scanned: cached.stats.rows_scanned,
-                rows_returned: cached.stats.rows_returned,
-                total_rows: cached.stats.total_rows,
-                parts_scanned: cached.stats.parts_scanned,
-                parts_skipped: cached.stats.parts_skipped,
-                bytes_read: cached.stats.bytes_read,
-                cached: true,
-            },
-            explain: cached.explain,
-            pagination: Pagination {
-                offset: req_offset,
-                limit: req_limit,
-                total: cached.total,
-                has_more: req_offset + req_limit < cached.total,
-            },
-            time_range: cached.time_range,
-            schema_columns: cached.schema_columns,
-            next_cursor: cached.next_cursor,
-        };
-        return (
-            StatusCode::OK,
-            Json(serde_json::to_value(response).unwrap_or_default()),
-        )
-            .into_response();
-    }
+    // Skip cache for paginated queries — each page has a unique cursor so
+    // the cache would never help and page-1 results would mask later pages.
+    if cursor_row_id.is_none() {
+        if let Some(cached) = state.query_cache().get(cache_key, current_flush_count) {
+            debug!("Query cache hit");
+            state
+                .metrics()
+                .query_cache_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let columns = resolve_column_types(&cached.columns);
+            let response = QueryResponse {
+                parsed: parsed_json,
+                columns,
+                rows: cached.rows,
+                stats: QueryStats {
+                    parse_time_us: u64::try_from(parse_time.as_micros()).unwrap_or(u64::MAX),
+                    execution_time_us: 0,
+                    rows_scanned: cached.stats.rows_scanned,
+                    rows_returned: cached.stats.rows_returned,
+                    total_rows: cached.stats.total_rows,
+                    parts_scanned: cached.stats.parts_scanned,
+                    parts_skipped: cached.stats.parts_skipped,
+                    bytes_read: cached.stats.bytes_read,
+                    cached: true,
+                },
+                explain: cached.explain,
+                pagination: Pagination {
+                    offset: req_offset,
+                    limit: req_limit,
+                    total: cached.total,
+                    has_more: req_offset + req_limit < cached.total,
+                },
+                time_range: cached.time_range,
+                schema_columns: cached.schema_columns,
+                next_cursor: cached.next_cursor,
+            };
+            return (
+                StatusCode::OK,
+                Json(serde_json::to_value(response).unwrap_or_default()),
+            )
+                .into_response();
+        }
+    } // cursor_row_id.is_none()
 
     state
         .metrics()
@@ -555,7 +559,10 @@ async fn execute_query(
                 schema_columns: response.schema_columns.clone(),
                 next_cursor: response.next_cursor.clone(),
             };
-            state.query_cache().put(cache_key, cache_entry);
+            // Only cache non-paginated queries — cursor pages are unique.
+            if cursor_row_id.is_none() {
+                state.query_cache().put(cache_key, cache_entry);
+            }
 
             (
                 StatusCode::OK,

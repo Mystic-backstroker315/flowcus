@@ -114,8 +114,6 @@ export function TimeHistogram({
 
   // ── Fetch histogram data ──────────────────────────────────
 
-  const hasFilters = filters.some((f) => f.field !== 'limit' && f.field && f.op);
-
   // Refs to capture current props at fetch time without triggering re-creation
   const timeRangeRef = useRef(timeRange);
   const filtersRef = useRef(filters);
@@ -590,7 +588,7 @@ export function TimeHistogram({
       <div className="time-histogram-footer">
         <span className="time-histogram-total">
           {totalRows > 0
-            ? `${hasFilters ? '~' : ''}${totalRows.toLocaleString()} flows in selected range`
+            ? `~${totalRows.toLocaleString()} flows in selected range`
             : histLoading
               ? 'Scanning\u2026'
               : '\u00A0'}

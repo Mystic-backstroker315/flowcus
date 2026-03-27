@@ -1459,3 +1459,214 @@ fn test_inprogress_cleanup_on_recovery() {
 
     cleanup(&dir);
 }
+
+// ---------------------------------------------------------------------------
+// Cursor pagination: no rows lost across pages
+// ---------------------------------------------------------------------------
+
+/// Regression test: cursor-based pagination must not permanently skip rows.
+///
+/// Before the fix, `process_part_columnar` truncated matching rows by on-disk
+/// index order before the global time-descending sort.  Rows truncated within a
+/// part could have `flowcusRowId` values above the cursor boundary, making them
+/// unreachable on subsequent pages.
+#[test]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_truncation
+)]
+fn test_cursor_pagination_no_rows_lost() {
+    let dir = test_dir("cursor_pagination_no_lost");
+
+    // Create two parts with different export times so parts overlap in the
+    // executor's time window.  Each message has enough rows so that the first
+    // page's limit will force within-part truncation (before the fix).
+    let mut writer = tiny_flush_writer(&dir);
+
+    // Part 1 — older, export_time = 1_700_000_000 (2023-11-14 ~22:13 UTC)
+    let records_old: Vec<DataRecord> = (0..30)
+        .map(|i| {
+            make_record(
+                Ipv4Addr::new(10, 0, 0, (i % 254 + 1) as u8),
+                Ipv4Addr::new(192, 168, 1, 1),
+                (i + 1) as u64 * 100,
+            )
+        })
+        .collect();
+    let msg1 = make_message_with_time(records_old, 1_700_000_000);
+    writer.ingest(&msg1);
+    writer.flush_all();
+
+    // Part 2 — newer, export_time = 1_700_000_060 (60 seconds later)
+    let records_new: Vec<DataRecord> = (0..30)
+        .map(|i| {
+            make_record(
+                Ipv4Addr::new(10, 1, 0, (i % 254 + 1) as u8),
+                Ipv4Addr::new(192, 168, 2, 1),
+                (i + 1) as u64 * 200,
+            )
+        })
+        .collect();
+    let msg2 = make_message_with_time(records_new, 1_700_000_060);
+    writer.ingest(&msg2);
+    writer.flush_all();
+
+    // Verify we have 2 parts
+    let table = Table::open(&dir, "flows").unwrap();
+    let parts = table.list_all_parts().unwrap();
+    assert!(
+        parts.len() >= 2,
+        "expected at least 2 parts, got {}",
+        parts.len()
+    );
+
+    // Query all rows using a wide absolute time range.
+    let executor = QueryExecutor::new(&dir, 8192);
+    let query = Query {
+        time_range: TimeRange::Absolute {
+            start: "2023-01-01".into(),
+            end: "2025-01-01".into(),
+        },
+        stages: vec![],
+    };
+
+    // First, get the total row count with a large limit.
+    let all = executor
+        .execute(&query, 0, 10_000, None, None, None)
+        .unwrap();
+    let total_rows = all.rows.len();
+    assert_eq!(total_rows, 60, "expected 60 total rows (30 + 30)");
+
+    // Now page through with a small limit using cursor pagination.
+    let page_size: u64 = 10;
+    let mut collected_row_ids: Vec<String> = Vec::new();
+    let mut cursor: Option<[u64; 2]> = None;
+    let mut pinned_time: Option<(u64, u64)> = None;
+    let mut pinned_cols: Option<Vec<String>> = None;
+    let mut pages = 0u32;
+
+    loop {
+        let result = executor
+            .execute(
+                &query,
+                0,
+                page_size,
+                pinned_time,
+                pinned_cols.clone(),
+                cursor,
+            )
+            .unwrap();
+
+        if result.rows.is_empty() {
+            break;
+        }
+
+        pages += 1;
+        assert!(pages <= 20, "too many pages — likely infinite loop");
+
+        // Pin time + columns from first page.
+        if pinned_time.is_none() {
+            pinned_time = Some((result.time_start, result.time_end));
+        }
+        pinned_cols = Some(result.schema_columns.clone());
+
+        // Collect flowcusRowId from each row.
+        let row_id_idx = result
+            .columns
+            .iter()
+            .position(|c| c == "flowcusRowId")
+            .expect("flowcusRowId must be in result columns");
+
+        for row in &result.rows {
+            if let Some(serde_json::Value::String(id)) = row.get(row_id_idx) {
+                collected_row_ids.push(id.clone());
+            }
+        }
+
+        // Advance cursor.
+        match &result.next_cursor {
+            Some(hex) => {
+                cursor = flowcus_storage::uuid7::parse_uuid_hex(hex);
+                assert!(cursor.is_some(), "next_cursor must be valid hex UUID");
+            }
+            None => break,
+        }
+
+        if result.rows.len() < page_size as usize {
+            break;
+        }
+    }
+
+    // All 60 rows must be present, with no duplicates.
+    assert_eq!(
+        collected_row_ids.len(),
+        total_rows,
+        "cursor pagination must return all {total_rows} rows, got {}",
+        collected_row_ids.len()
+    );
+
+    let unique: std::collections::HashSet<&String> = collected_row_ids.iter().collect();
+    assert_eq!(
+        unique.len(),
+        total_rows,
+        "cursor pagination must not produce duplicate rows"
+    );
+
+    // Verify monotonically decreasing flowcusExportTime across pages
+    // (results are sorted desc).
+    let mut cursor2: Option<[u64; 2]> = None;
+    let mut prev_time = u64::MAX;
+    let mut pinned_time2: Option<(u64, u64)> = None;
+    let mut pinned_cols2: Option<Vec<String>> = None;
+
+    loop {
+        let result = executor
+            .execute(
+                &query,
+                0,
+                page_size,
+                pinned_time2,
+                pinned_cols2.clone(),
+                cursor2,
+            )
+            .unwrap();
+
+        if result.rows.is_empty() {
+            break;
+        }
+
+        if pinned_time2.is_none() {
+            pinned_time2 = Some((result.time_start, result.time_end));
+        }
+        pinned_cols2 = Some(result.schema_columns.clone());
+
+        let page_time_idx = result
+            .columns
+            .iter()
+            .position(|c| c == "flowcusExportTime")
+            .unwrap();
+
+        for row in &result.rows {
+            let t = row[page_time_idx].as_u64().unwrap_or(0);
+            assert!(
+                t <= prev_time,
+                "rows must be in descending time order: {t} > {prev_time}"
+            );
+            prev_time = t;
+        }
+
+        match &result.next_cursor {
+            Some(hex) => {
+                cursor2 = flowcus_storage::uuid7::parse_uuid_hex(hex);
+            }
+            None => break,
+        }
+
+        if result.rows.len() < page_size as usize {
+            break;
+        }
+    }
+
+    cleanup(&dir);
+}

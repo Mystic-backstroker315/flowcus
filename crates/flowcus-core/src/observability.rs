@@ -64,8 +64,6 @@ pub struct Metrics {
     pub merge_queue_active: AtomicI64,
     /// Cumulative hours sealed (converged to 1 part).
     pub merge_queue_sealed: AtomicU64,
-    /// Total unmerged parts across all dirty hours.
-    pub merge_unmerged_parts: AtomicI64,
     /// Total columns processed across all merges.
     pub merge_columns_processed: AtomicU64,
     /// Cumulative merge job duration in milliseconds.
@@ -144,7 +142,6 @@ impl Metrics {
             merge_queue_pending: AtomicI64::new(0),
             merge_queue_active: AtomicI64::new(0),
             merge_queue_sealed: AtomicU64::new(0),
-            merge_unmerged_parts: AtomicI64::new(0),
             merge_columns_processed: AtomicU64::new(0),
             merge_job_duration_ms: AtomicU64::new(0),
 
@@ -294,10 +291,6 @@ impl Metrics {
             (
                 "merge_queue_sealed",
                 self.merge_queue_sealed.load(Ordering::Relaxed) as i64,
-            ),
-            (
-                "merge_unmerged_parts",
-                self.merge_unmerged_parts.load(Ordering::Relaxed),
             ),
             (
                 "merge_columns_processed",
@@ -588,12 +581,6 @@ impl Metrics {
             "flowcus_merge_queue_sealed_total",
             "Hours sealed (converged to single part)",
             &self.merge_queue_sealed,
-        );
-        gauge_i(
-            &mut out,
-            "flowcus_merge_unmerged_parts",
-            "Total unmerged parts across all dirty hours",
-            &self.merge_unmerged_parts,
         );
         counter(
             &mut out,
