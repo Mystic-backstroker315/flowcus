@@ -63,6 +63,15 @@ pub struct IpfixConfig {
     /// Template expiry in seconds (RFC 7011 recommends at least 3x export interval).
     #[serde(default = "default_template_expiry_secs")]
     pub template_expiry_secs: u64,
+    /// Directory for unprocessed data files (relative to storage dir).
+    #[serde(default = "default_unprocessed_dir")]
+    pub unprocessed_dir: String,
+    /// Time in seconds before unprocessed files are deleted.
+    #[serde(default = "default_unprocessed_ttl_secs")]
+    pub unprocessed_ttl_secs: u64,
+    /// How often to check for reprocessable/expired files (seconds).
+    #[serde(default = "default_unprocessed_scan_interval_secs")]
+    pub unprocessed_scan_interval_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +248,18 @@ const fn default_template_expiry_secs() -> u64 {
     1800
 }
 
+fn default_unprocessed_dir() -> String {
+    "unprocessed".to_string()
+}
+
+const fn default_unprocessed_ttl_secs() -> u64 {
+    300
+}
+
+const fn default_unprocessed_scan_interval_secs() -> u64 {
+    10
+}
+
 fn num_cpus() -> usize {
     std::thread::available_parallelism()
         .map(std::num::NonZero::get)
@@ -284,6 +305,9 @@ impl Default for IpfixConfig {
             tcp: false,
             udp_recv_buffer: default_udp_recv_buffer(),
             template_expiry_secs: default_template_expiry_secs(),
+            unprocessed_dir: default_unprocessed_dir(),
+            unprocessed_ttl_secs: default_unprocessed_ttl_secs(),
+            unprocessed_scan_interval_secs: default_unprocessed_scan_interval_secs(),
         }
     }
 }

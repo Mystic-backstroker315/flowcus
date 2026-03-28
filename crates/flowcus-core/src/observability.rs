@@ -26,6 +26,14 @@ pub struct Metrics {
     pub ipfix_tcp_connections: AtomicI64,
     /// Unique unknown IEs encountered (not in registry). Per RFC 5153.
     pub ipfix_unknown_ies: AtomicU64,
+    /// Packets saved to .unproc files (no template available).
+    pub ipfix_unprocessed_saved: AtomicU64,
+    /// Packets successfully reprocessed from .unproc files.
+    pub ipfix_unprocessed_reprocessed: AtomicU64,
+    /// Packets expired (TTL exceeded, deleted).
+    pub ipfix_unprocessed_expired: AtomicU64,
+    /// Current count of pending .unproc files.
+    pub ipfix_unprocessed_pending: AtomicI64,
 
     // ---- Storage writer (ingestion) ----
     pub writer_records_ingested: AtomicU64,
@@ -77,6 +85,10 @@ impl Metrics {
             ipfix_templates_active: AtomicI64::new(0),
             ipfix_tcp_connections: AtomicI64::new(0),
             ipfix_unknown_ies: AtomicU64::new(0),
+            ipfix_unprocessed_saved: AtomicU64::new(0),
+            ipfix_unprocessed_reprocessed: AtomicU64::new(0),
+            ipfix_unprocessed_expired: AtomicU64::new(0),
+            ipfix_unprocessed_pending: AtomicI64::new(0),
 
             writer_records_ingested: AtomicU64::new(0),
             writer_parts_flushed: AtomicU64::new(0),
@@ -180,6 +192,30 @@ impl Metrics {
             "flowcus_ipfix_unknown_ies_total",
             "Unique unknown IEs encountered (not in registry, stored as OctetArray per RFC 5153)",
             &self.ipfix_unknown_ies,
+        );
+        counter(
+            &mut out,
+            "flowcus_ipfix_unprocessed_saved_total",
+            "Packets saved to .unproc files (no template available)",
+            &self.ipfix_unprocessed_saved,
+        );
+        counter(
+            &mut out,
+            "flowcus_ipfix_unprocessed_reprocessed_total",
+            "Packets successfully reprocessed from .unproc files",
+            &self.ipfix_unprocessed_reprocessed,
+        );
+        counter(
+            &mut out,
+            "flowcus_ipfix_unprocessed_expired_total",
+            "Packets expired (TTL exceeded, deleted)",
+            &self.ipfix_unprocessed_expired,
+        );
+        gauge_i(
+            &mut out,
+            "flowcus_ipfix_unprocessed_pending",
+            "Current count of pending .unproc files",
+            &self.ipfix_unprocessed_pending,
         );
 
         // Writer

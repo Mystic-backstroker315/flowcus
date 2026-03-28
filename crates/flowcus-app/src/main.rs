@@ -132,7 +132,12 @@ async fn main() -> Result<()> {
     flowcus_storage::merge::start(table_base, merge_config, pending, Arc::clone(&metrics));
 
     // IPFIX collector — pass metrics for live counter updates
-    let ipfix = IpfixListener::new(&config.ipfix, sink, Arc::clone(&metrics));
+    let ipfix = IpfixListener::new(
+        &config.ipfix,
+        sink,
+        Arc::clone(&metrics),
+        &config.storage.dir,
+    );
     tokio::spawn(async move {
         if let Err(e) = ipfix.run().await {
             error!(error = %e, "IPFIX listener failed");

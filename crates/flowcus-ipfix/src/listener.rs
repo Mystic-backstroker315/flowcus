@@ -15,8 +15,9 @@ use flowcus_core::observability::Metrics;
 
 use crate::decoder;
 use crate::display::DisplayMessage;
-use crate::protocol::{self, IpfixMessage};
+use crate::protocol::{self, IpfixMessage, SetContents};
 use crate::session::SessionStore;
+use crate::unprocessed;
 
 /// Callback for decoded IPFIX messages. Implementations must be Send + Sync.
 pub trait MessageSink: Send + Sync + 'static {
@@ -35,15 +36,23 @@ pub struct IpfixListener {
     session: Arc<Mutex<SessionStore>>,
     sink: Arc<dyn MessageSink>,
     metrics: Arc<Metrics>,
+    unprocessed_dir: std::path::PathBuf,
 }
 
 impl IpfixListener {
-    pub fn new(config: &IpfixConfig, sink: Arc<dyn MessageSink>, metrics: Arc<Metrics>) -> Self {
+    pub fn new(
+        config: &IpfixConfig,
+        sink: Arc<dyn MessageSink>,
+        metrics: Arc<Metrics>,
+        storage_dir: &str,
+    ) -> Self {
+        let unprocessed_dir = std::path::PathBuf::from(storage_dir).join(&config.unprocessed_dir);
         Self {
             config: config.clone(),
             session: Arc::new(Mutex::new(SessionStore::new(config.template_expiry_secs))),
             sink,
             metrics,
+            unprocessed_dir,
         }
     }
 
@@ -67,8 +76,9 @@ impl IpfixListener {
             let sink = Arc::clone(&self.sink);
             let m = Arc::clone(&self.metrics);
             let buf_size = self.config.udp_recv_buffer;
+            let udir = self.unprocessed_dir.clone();
             handles.push(tokio::spawn(async move {
-                run_udp(socket, session, sink, m, buf_size).await;
+                run_udp(socket, session, sink, m, buf_size, udir).await;
             }));
         }
 
@@ -82,8 +92,9 @@ impl IpfixListener {
             let session = Arc::clone(&self.session);
             let sink = Arc::clone(&self.sink);
             let m = Arc::clone(&self.metrics);
+            let udir = self.unprocessed_dir.clone();
             handles.push(tokio::spawn(async move {
-                run_tcp(listener, session, sink, m).await;
+                run_tcp(listener, session, sink, m, udir).await;
             }));
         }
 
@@ -106,6 +117,16 @@ impl IpfixListener {
                 }
             }
         }));
+
+        // Unprocessed packet reprocessing worker
+        unprocessed::start_worker(
+            self.unprocessed_dir.clone(),
+            Arc::clone(&self.session),
+            Arc::clone(&self.sink),
+            Arc::clone(&self.metrics),
+            std::time::Duration::from_secs(self.config.unprocessed_ttl_secs),
+            std::time::Duration::from_secs(self.config.unprocessed_scan_interval_secs),
+        );
 
         if handles.is_empty() {
             warn!("No IPFIX listeners configured (both UDP and TCP disabled)");
@@ -133,6 +154,7 @@ async fn run_udp(
     sink: Arc<dyn MessageSink>,
     metrics: Arc<Metrics>,
     buf_size: usize,
+    unprocessed_dir: std::path::PathBuf,
 ) {
     let mut buf = vec![0u8; buf_size];
 
@@ -149,7 +171,15 @@ async fn run_udp(
                     debug!(len, %src, "UDP datagram too short for IPFIX header, discarding");
                     continue;
                 }
-                process_ipfix_packet(&buf[..len], src, &session, &sink, &metrics).await;
+                process_ipfix_packet(
+                    &buf[..len],
+                    src,
+                    &session,
+                    &sink,
+                    &metrics,
+                    &unprocessed_dir,
+                )
+                .await;
             }
             Err(e) => {
                 error!(error = %e, "UDP recv error");
@@ -163,6 +193,7 @@ async fn run_tcp(
     session: Arc<Mutex<SessionStore>>,
     sink: Arc<dyn MessageSink>,
     metrics: Arc<Metrics>,
+    unprocessed_dir: std::path::PathBuf,
 ) {
     loop {
         match listener.accept().await {
@@ -174,8 +205,9 @@ async fn run_tcp(
                 let session = Arc::clone(&session);
                 let sink = Arc::clone(&sink);
                 let m = Arc::clone(&metrics);
+                let udir = unprocessed_dir.clone();
                 tokio::spawn(async move {
-                    handle_tcp_connection(stream, src, session, sink, m).await;
+                    handle_tcp_connection(stream, src, session, sink, m, udir).await;
                 });
             }
             Err(e) => {
@@ -191,6 +223,7 @@ async fn handle_tcp_connection(
     session: Arc<Mutex<SessionStore>>,
     sink: Arc<dyn MessageSink>,
     metrics: Arc<Metrics>,
+    unprocessed_dir: std::path::PathBuf,
 ) {
     use tokio::io::AsyncReadExt;
 
@@ -241,7 +274,7 @@ async fn handle_tcp_connection(
         metrics
             .ipfix_bytes_received
             .fetch_add(msg_buf.len() as u64, std::sync::atomic::Ordering::Relaxed);
-        process_ipfix_packet(&msg_buf, src, &session, &sink, &metrics).await;
+        process_ipfix_packet(&msg_buf, src, &session, &sink, &metrics, &unprocessed_dir).await;
     }
 }
 
@@ -251,6 +284,7 @@ async fn process_ipfix_packet(
     session: &Arc<Mutex<SessionStore>>,
     sink: &Arc<dyn MessageSink>,
     metrics: &Arc<Metrics>,
+    unprocessed_dir: &std::path::Path,
 ) {
     use std::sync::atomic::Ordering::Relaxed;
     let _t = flowcus_core::profiling::span_timer("ipfix;process_packet");
@@ -268,11 +302,35 @@ async fn process_ipfix_packet(
                     .store(session.template_count() as i64, Relaxed);
             }
 
+            // Check for data sets that could not be decoded (missing template).
+            let missing_tids: Vec<u16> = msg
+                .sets
+                .iter()
+                .filter_map(|s| {
+                    if let SetContents::Data(d) = &s.contents {
+                        if d.records.is_empty() && d.template_id >= protocol::MIN_DATA_SET_ID {
+                            return Some(d.template_id);
+                        }
+                    }
+                    None
+                })
+                .collect();
+
+            if !missing_tids.is_empty() {
+                if let Err(e) =
+                    unprocessed::save_unprocessed(unprocessed_dir, buf, src, &missing_tids)
+                {
+                    warn!(error = %e, "Failed to save unprocessed IPFIX packet");
+                } else {
+                    metrics.ipfix_unprocessed_saved.fetch_add(1, Relaxed);
+                }
+            }
+
             let record_count: usize = msg
                 .sets
                 .iter()
                 .filter_map(|s| {
-                    if let protocol::SetContents::Data(d) = &s.contents {
+                    if let SetContents::Data(d) = &s.contents {
                         Some(d.records.len())
                     } else {
                         None
@@ -311,7 +369,7 @@ mod tests {
     async fn listener_creation() {
         let config = IpfixConfig::default();
         let metrics = Metrics::new();
-        let listener = IpfixListener::new(&config, Arc::new(LogOnlySink), metrics);
+        let listener = IpfixListener::new(&config, Arc::new(LogOnlySink), metrics, "storage");
         assert_eq!(listener.template_count().await, 0);
     }
 }
