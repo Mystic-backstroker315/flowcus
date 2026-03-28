@@ -39,7 +39,8 @@
       "Bash(ls frontend/src/*.tsx frontend/src/*.ts)",
       "Bash(find crates/flowcus-query/ crates/flowcus-server/src/query.rs -name *.rs)",
       "Bash(find frontend/src/ -name *.ts -o -name *.tsx)",
-      "Bash(git -C /home/consi/Devel/flowcus status crates/flowcus-query/)"
+      "Bash(git -C /home/consi/Devel/flowcus status crates/flowcus-query/)",
+      "Bash(echo \"exit: $?\")"
     ]
   }
 }

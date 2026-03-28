@@ -38,4 +38,12 @@ impl AppState {
     pub fn metrics(&self) -> &Arc<Metrics> {
         &self.inner.metrics
     }
+
+    pub fn storage_dir(&self) -> &str {
+        &self.inner.config.storage.dir
+    }
+
+    pub fn granule_size(&self) -> usize {
+        self.inner.config.storage.granule_size
+    }
 }

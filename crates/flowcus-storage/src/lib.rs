@@ -29,12 +29,23 @@
     clippy::needless_pass_by_value,
     clippy::significant_drop_tightening,
     clippy::string_lit_as_bytes,
-    clippy::manual_string_new
+    clippy::manual_string_new,
+    clippy::assigning_clones,
+    clippy::manual_range_contains,
+    clippy::manual_let_else,
+    clippy::if_not_else,
+    clippy::match_wildcard_for_single_variants,
+    clippy::too_many_lines,
+    clippy::unused_self,
+    clippy::collapsible_if,
+    clippy::single_match
 )]
 
 pub mod codec;
 pub mod column;
 pub mod crc;
+pub mod decode;
+pub mod executor;
 pub mod granule;
 pub mod ingest;
 pub mod merge;

@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::Instant;
 
 use axum::{
@@ -26,6 +27,7 @@ pub struct QueryResponse {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<serde_json::Value>>,
     pub stats: QueryStats,
+    pub explain: Vec<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -91,8 +93,9 @@ pub fn routes() -> Router<AppState> {
 // POST /api/query
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 async fn execute_query(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Json(req): Json<QueryRequest>,
 ) -> impl IntoResponse {
     let start = Instant::now();
@@ -104,29 +107,97 @@ async fn execute_query(
             let parsed = serde_json::to_value(&query).unwrap_or_default();
             let exec_start = Instant::now();
 
-            // Execution engine not yet implemented — return parsed AST with empty results.
-            let columns = extract_columns(&query);
+            // Create executor and run the query against storage
+            let storage_dir = state.storage_dir().to_string();
+            let granule_size = state.granule_size();
+            let query_clone = query.clone();
+
+            let exec_result = tokio::task::spawn_blocking(move || {
+                let executor = flowcus_storage::executor::QueryExecutor::new(
+                    Path::new(&storage_dir),
+                    granule_size,
+                );
+                executor.execute(&query_clone)
+            })
+            .await;
+
             let exec_time = exec_start.elapsed();
 
-            let response = QueryResponse {
-                parsed,
-                columns,
-                rows: Vec::new(),
-                stats: QueryStats {
-                    parse_time_us: u64::try_from(parse_time.as_micros()).unwrap_or(u64::MAX),
-                    execution_time_us: u64::try_from(exec_time.as_micros()).unwrap_or(u64::MAX),
-                    rows_scanned: 0,
-                    rows_returned: 0,
-                    parts_scanned: 0,
-                    parts_skipped: 0,
-                },
-            };
+            match exec_result {
+                Ok(Ok(result)) => {
+                    let explain: Vec<serde_json::Value> = result
+                        .plan
+                        .steps
+                        .iter()
+                        .filter_map(|step| serde_json::to_value(step).ok())
+                        .collect();
 
-            (
-                StatusCode::OK,
-                Json(serde_json::to_value(response).unwrap_or_default()),
-            )
-                .into_response()
+                    let rows_returned = result.rows.len() as u64;
+
+                    let response = QueryResponse {
+                        parsed,
+                        columns: result.columns,
+                        rows: result.rows,
+                        stats: QueryStats {
+                            parse_time_us: u64::try_from(parse_time.as_micros())
+                                .unwrap_or(u64::MAX),
+                            execution_time_us: u64::try_from(exec_time.as_micros())
+                                .unwrap_or(u64::MAX),
+                            rows_scanned: result.rows_scanned,
+                            rows_returned,
+                            parts_scanned: result.parts_scanned,
+                            parts_skipped: result.parts_skipped,
+                        },
+                        explain,
+                    };
+
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::to_value(response).unwrap_or_default()),
+                    )
+                        .into_response()
+                }
+                Ok(Err(io_err)) => {
+                    // I/O error during execution — still return parsed AST with error
+                    let response = QueryResponse {
+                        parsed,
+                        columns: extract_columns(&query),
+                        rows: Vec::new(),
+                        stats: QueryStats {
+                            parse_time_us: u64::try_from(parse_time.as_micros())
+                                .unwrap_or(u64::MAX),
+                            execution_time_us: u64::try_from(exec_time.as_micros())
+                                .unwrap_or(u64::MAX),
+                            rows_scanned: 0,
+                            rows_returned: 0,
+                            parts_scanned: 0,
+                            parts_skipped: 0,
+                        },
+                        explain: vec![serde_json::json!({
+                            "type": "Error",
+                            "message": io_err.to_string()
+                        })],
+                    };
+
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::to_value(response).unwrap_or_default()),
+                    )
+                        .into_response()
+                }
+                Err(join_err) => {
+                    let response = QueryError {
+                        error: format!("Execution failed: {join_err}"),
+                        position: None,
+                        suggestion: None,
+                    };
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::to_value(response).unwrap_or_default()),
+                    )
+                        .into_response()
+                }
+            }
         }
         Err(err) => {
             let (position, suggestion) = parse_error_details(&err);

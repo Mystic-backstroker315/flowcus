@@ -14,6 +14,7 @@ workspace = true
 flowcus-core = { workspace = true }
 flowcus-ipfix = { workspace = true }
 flowcus-query = { workspace = true }
+flowcus-storage = { workspace = true }
 flowcus-worker = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
