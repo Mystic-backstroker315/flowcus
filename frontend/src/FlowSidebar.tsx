@@ -18,7 +18,7 @@ export function FlowSidebar({
   selectedIndex,
   onClose,
   onNavigate,
-  totalRows,
+  totalRows: _totalRows,
   onAddFilter,
 }: FlowSidebarProps) {
   const row = rows[selectedIndex];
