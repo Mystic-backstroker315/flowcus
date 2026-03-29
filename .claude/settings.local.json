@@ -1,15 +1,21 @@
 {
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  },
   "permissions": {
-    "defaultMode": "dontAsk"
+    "allow": [
+      "Bash(npx tsc:*)",
+      "Bash(printf 'n\\\\ny\\\\n')",
+      "Bash(printf 'y\\\\nn\\\\n')"
+    ],
+    "defaultMode": "plan"
   },
   "statusLine": {
     "type": "command",
     "command": "bash /home/consi/.claude/statusline-command.sh"
   },
-  "attribution": {
-    "commit": "Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>",
-    "pr": "Generated with [Claude Code](https://claude.ai/code) — Opus 4.6 (1M context)"
-  },
+  "spinnerTipsEnabled": true,
   "spinnerVerbs": {
     "mode": "append",
     "verbs": [
@@ -30,20 +36,9 @@
       "Hashing exporters"
     ]
   },
-  "spinnerTipsEnabled": true,
   "spinnerTipsOverride": {
     "excludeDefault": false,
     "tips": [
-      "Use /test to run the full test suite after changes",
-      "Use /build to compile for production (single binary)",
-      "Use /ci to run the local CI pipeline before pushing",
-      "Agents run in parallel — spawn multiple for independent crate work",
-      "storage-integrity-engineer audits merge safety and crash scenarios",
-      "test-engineer runs proactively after code changes — no need to ask",
-      "query-engine-architect handles FQL parser, planner, and execution",
-      "ipfix-ingestion-engine covers wire parsing through columnar flush",
-      "frontend-engineer handles React components, Vite config, and UX",
-      "The flowcus-query crate is the newest — FQL parser and AST live there",
       "Set lengths in IPFIX always include the 4-byte header",
       "Granule size is 8192 rows — marks and blooms index at this boundary",
       "Part names encode generation, time range, and sequence number",
