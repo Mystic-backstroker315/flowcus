@@ -27,6 +27,7 @@ struct Cli {
     storage: Option<String>,
 
     /// Enable development mode (human logs, frontend proxy)
+    #[cfg(feature = "dev-mode")]
     #[arg(short, long, env = "FLOWCUS_DEV")]
     dev: bool,
 
@@ -62,6 +63,7 @@ async fn main() -> Result<()> {
         config.storage.dir = dir.to_string();
     }
 
+    #[cfg(feature = "dev-mode")]
     if cli.dev {
         config.server.dev_mode = true;
         config.logging.format = LogFormat::Human;

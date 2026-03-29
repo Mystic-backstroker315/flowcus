@@ -18,11 +18,11 @@ dev: frontend-install
     VITE_PID=$!
     trap "kill $VITE_PID 2>/dev/null" EXIT
     # Run Rust server in dev mode
-    RUST_LOG=debug cargo run -p flowcus-app -- --dev
+    RUST_LOG=debug cargo run -p flowcus-app --features dev-mode -- --dev
 
 # Run only the backend in dev mode
 dev-backend:
-    RUST_LOG=debug cargo run -p flowcus-app -- --dev
+    RUST_LOG=debug cargo run -p flowcus-app --features dev-mode -- --dev
 
 # Run only the frontend dev server
 dev-frontend: frontend-install

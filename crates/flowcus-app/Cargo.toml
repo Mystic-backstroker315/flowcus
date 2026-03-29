@@ -11,6 +11,9 @@ rust-version.workspace = true
 name = "flowcus"
 path = "src/main.rs"
 
+[features]
+dev-mode = []
+
 [lints]
 workspace = true
 
