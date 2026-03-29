@@ -130,17 +130,97 @@ pub fn system_columns() -> Vec<ColumnDef> {
     ]
 }
 
+/// Column definition for `flowcusFlowDuration` (milliseconds).
+fn flow_duration_column() -> ColumnDef {
+    ColumnDef {
+        name: "flowcusFlowDuration".into(),
+        element_id: 1,
+        enterprise_id: SYSTEM_ENTERPRISE_ID,
+        data_type: DataType::Unsigned32,
+        storage_type: StorageType::U32,
+        wire_length: 4,
+    }
+}
+
+/// Describes which start/end time pair is available for computing flow duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurationSource {
+    /// IE 150 + 151: seconds → multiply difference by 1000.
+    Seconds { start_idx: usize, end_idx: usize },
+    /// IE 152 + 153: milliseconds → difference is already in ms.
+    Milliseconds { start_idx: usize, end_idx: usize },
+    /// IE 22 + 21: sysUpTime (already ms) → difference is already in ms.
+    SysUpTime { start_idx: usize, end_idx: usize },
+}
+
+/// Check whether a template has a start/end time pair suitable for computing
+/// flow duration, and that it does NOT already contain IE 161
+/// (`flowDurationMilliseconds`).
+///
+/// The returned indices are relative to the `specs` slice (i.e. template field
+/// index, NOT schema column index). The caller must add the system-column offset
+/// to get the schema column index.
+pub fn detect_duration_source(specs: &[FieldSpecifier]) -> Option<DurationSource> {
+    // If the template already exports flowDurationMilliseconds, skip.
+    if specs
+        .iter()
+        .any(|s| s.element_id == 161 && s.enterprise_id == 0)
+    {
+        return None;
+    }
+
+    let find = |ie: u16| -> Option<usize> {
+        specs
+            .iter()
+            .position(|s| s.element_id == ie && s.enterprise_id == 0)
+    };
+
+    // Prefer millisecond precision, then seconds, then sysUpTime.
+    if let (Some(si), Some(ei)) = (find(152), find(153)) {
+        return Some(DurationSource::Milliseconds {
+            start_idx: si,
+            end_idx: ei,
+        });
+    }
+    if let (Some(si), Some(ei)) = (find(150), find(151)) {
+        return Some(DurationSource::Seconds {
+            start_idx: si,
+            end_idx: ei,
+        });
+    }
+    if let (Some(si), Some(ei)) = (find(22), find(21)) {
+        return Some(DurationSource::SysUpTime {
+            start_idx: si,
+            end_idx: ei,
+        });
+    }
+    None
+}
+
 /// A table schema: an ordered list of column definitions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Schema {
     pub columns: Vec<ColumnDef>,
+    /// If present, flow duration is computed during ingest from this source.
+    /// Not serialized to disk — rebuilt from column presence on deserialization.
+    #[serde(skip)]
+    pub duration_source: Option<DurationSource>,
 }
 
 impl Schema {
     /// Build a schema from an IPFIX template's field specifiers.
     /// System columns are automatically prepended before the template-derived columns.
+    /// If the template contains a start/end time pair (and no native
+    /// `flowDurationMilliseconds`), a computed `flowcusFlowDuration` column
+    /// is appended after the system columns, before the template columns.
     pub fn from_template(specs: &[FieldSpecifier]) -> Self {
         let mut columns = system_columns();
+        let duration_source = detect_duration_source(specs);
+
+        if duration_source.is_some() {
+            columns.push(flow_duration_column());
+        }
+
         columns.extend(specs.iter().map(|spec| {
             let dt = ie::data_type(spec.element_id, spec.enterprise_id);
             let st = storage_type_for(dt);
@@ -153,7 +233,19 @@ impl Schema {
                 wire_length: spec.field_length,
             }
         }));
-        Self { columns }
+        Self {
+            columns,
+            duration_source,
+        }
+    }
+
+    /// Number of system/computed columns (columns with `SYSTEM_ENTERPRISE_ID`).
+    /// These come before the template-derived columns in the schema.
+    pub fn system_column_count(&self) -> usize {
+        self.columns
+            .iter()
+            .filter(|c| c.enterprise_id == SYSTEM_ENTERPRISE_ID)
+            .count()
     }
 
     /// Fingerprint for deduplicating schemas (same columns = same schema).
@@ -228,5 +320,202 @@ mod tests {
         assert_eq!(StorageType::U32.element_size(), Some(4));
         assert_eq!(StorageType::U128.element_size(), Some(16));
         assert_eq!(StorageType::VarLen.element_size(), None);
+    }
+
+    #[test]
+    fn duration_column_added_for_millisecond_timestamps() {
+        let specs = vec![
+            FieldSpecifier {
+                element_id: 8,
+                field_length: 4,
+                enterprise_id: 0,
+            },
+            FieldSpecifier {
+                element_id: 152,
+                field_length: 8,
+                enterprise_id: 0,
+            }, // flowStartMilliseconds
+            FieldSpecifier {
+                element_id: 153,
+                field_length: 8,
+                enterprise_id: 0,
+            }, // flowEndMilliseconds
+        ];
+        let schema = Schema::from_template(&specs);
+        // 4 base system + 1 duration + 3 template = 8
+        assert_eq!(schema.columns.len(), 8);
+        assert_eq!(schema.columns[4].name, "flowcusFlowDuration");
+        assert_eq!(schema.columns[4].storage_type, StorageType::U32);
+        assert!(matches!(
+            schema.duration_source,
+            Some(DurationSource::Milliseconds { .. })
+        ));
+        assert_eq!(schema.system_column_count(), 5);
+    }
+
+    #[test]
+    fn duration_column_added_for_second_timestamps() {
+        let specs = vec![
+            FieldSpecifier {
+                element_id: 150,
+                field_length: 4,
+                enterprise_id: 0,
+            }, // flowStartSeconds
+            FieldSpecifier {
+                element_id: 151,
+                field_length: 4,
+                enterprise_id: 0,
+            }, // flowEndSeconds
+        ];
+        let schema = Schema::from_template(&specs);
+        assert_eq!(schema.columns[4].name, "flowcusFlowDuration");
+        assert!(matches!(
+            schema.duration_source,
+            Some(DurationSource::Seconds { .. })
+        ));
+    }
+
+    #[test]
+    fn duration_column_added_for_sysuptime() {
+        let specs = vec![
+            FieldSpecifier {
+                element_id: 22,
+                field_length: 4,
+                enterprise_id: 0,
+            }, // flowStartSysUpTime
+            FieldSpecifier {
+                element_id: 21,
+                field_length: 4,
+                enterprise_id: 0,
+            }, // flowEndSysUpTime
+        ];
+        let schema = Schema::from_template(&specs);
+        assert_eq!(schema.columns[4].name, "flowcusFlowDuration");
+        assert!(matches!(
+            schema.duration_source,
+            Some(DurationSource::SysUpTime { .. })
+        ));
+    }
+
+    #[test]
+    fn no_duration_column_when_native_ie161_present() {
+        let specs = vec![
+            FieldSpecifier {
+                element_id: 152,
+                field_length: 8,
+                enterprise_id: 0,
+            },
+            FieldSpecifier {
+                element_id: 153,
+                field_length: 8,
+                enterprise_id: 0,
+            },
+            FieldSpecifier {
+                element_id: 161,
+                field_length: 4,
+                enterprise_id: 0,
+            }, // flowDurationMilliseconds
+        ];
+        let schema = Schema::from_template(&specs);
+        assert!(schema.duration_source.is_none());
+        assert!(
+            !schema
+                .columns
+                .iter()
+                .any(|c| c.name == "flowcusFlowDuration")
+        );
+        assert_eq!(schema.system_column_count(), 4); // only base system columns
+    }
+
+    #[test]
+    fn no_duration_column_without_time_pair() {
+        let specs = vec![
+            FieldSpecifier {
+                element_id: 8,
+                field_length: 4,
+                enterprise_id: 0,
+            },
+            FieldSpecifier {
+                element_id: 12,
+                field_length: 4,
+                enterprise_id: 0,
+            },
+        ];
+        let schema = Schema::from_template(&specs);
+        assert!(schema.duration_source.is_none());
+        assert_eq!(schema.system_column_count(), 4);
+    }
+
+    #[test]
+    fn fingerprint_excludes_duration_column() {
+        let specs_with_time = vec![
+            FieldSpecifier {
+                element_id: 8,
+                field_length: 4,
+                enterprise_id: 0,
+            },
+            FieldSpecifier {
+                element_id: 152,
+                field_length: 8,
+                enterprise_id: 0,
+            },
+            FieldSpecifier {
+                element_id: 153,
+                field_length: 8,
+                enterprise_id: 0,
+            },
+        ];
+        let specs_without_time = vec![
+            FieldSpecifier {
+                element_id: 8,
+                field_length: 4,
+                enterprise_id: 0,
+            },
+            FieldSpecifier {
+                element_id: 152,
+                field_length: 8,
+                enterprise_id: 0,
+            },
+            FieldSpecifier {
+                element_id: 153,
+                field_length: 8,
+                enterprise_id: 0,
+            },
+        ];
+        let s1 = Schema::from_template(&specs_with_time);
+        let s2 = Schema::from_template(&specs_without_time);
+        assert_eq!(s1.fingerprint(), s2.fingerprint());
+    }
+
+    #[test]
+    fn milliseconds_preferred_over_seconds() {
+        // Template with both second and millisecond pairs — ms should win.
+        let specs = vec![
+            FieldSpecifier {
+                element_id: 150,
+                field_length: 4,
+                enterprise_id: 0,
+            },
+            FieldSpecifier {
+                element_id: 151,
+                field_length: 4,
+                enterprise_id: 0,
+            },
+            FieldSpecifier {
+                element_id: 152,
+                field_length: 8,
+                enterprise_id: 0,
+            },
+            FieldSpecifier {
+                element_id: 153,
+                field_length: 8,
+                enterprise_id: 0,
+            },
+        ];
+        let schema = Schema::from_template(&specs);
+        assert!(matches!(
+            schema.duration_source,
+            Some(DurationSource::Milliseconds { .. })
+        ));
     }
 }

@@ -7,7 +7,8 @@ IPFIX collector, columnar storage, and query system for network flow analysis. R
 - `flowcus-core` - Config (`AppConfig` with 5 sections), error types, telemetry (human/json), observability (Prometheus metrics), profiling (dev-mode snapshots + stack traces)
 - `flowcus-ipfix` - IPFIX protocol: wire parsing, IE registry (IANA + 9 vendors), session/template management, decoder, UDP/TCP listener, trace-level pretty printer
 - `flowcus-storage` - Columnar storage engine (see below)
-- `flowcus-server` - Axum on :2137, API routes (`/api/health`, `/api/info`), observability routes (`/observability/metrics`), embedded frontend
+- `flowcus-query` - FQL query language: hand-written lexer/parser, typed AST, semantic validation
+- `flowcus-server` - Axum on :2137, API routes (`/api/health`, `/api/info`, `/api/query`), observability routes (`/observability/metrics`), embedded frontend
 - `flowcus-app` - Binary entrypoint, CLI parsing, runtime orchestration
 
 ## Storage Crate Modules
@@ -71,6 +72,39 @@ just build        # Production build (single binary)
 ### Git
 - Conventional commits: `feat:`, `fix:`, `refactor:`, `test:`, `docs:`, `ci:`, `perf:`
 - PR branches: `feat/description`, `fix/description`
+
+## Agent Coordination & Parallelization
+
+### Agent Roster
+| Agent | Crate Scope | Color | Role |
+|-------|------------|-------|------|
+| `storage-integrity-engineer` | flowcus-storage | red | Schema, merge, writer, part format, crash safety |
+| `ipfix-ingestion-engine` | flowcus-ipfix + ingest path | green | Wire parsing, IE registry, templates, decoder |
+| `query-engine-architect` | flowcus-query + executor | purple | FQL parser, AST, planner, vectorized execution |
+| `frontend-engineer` | frontend/ | orange | React components, Vite, UX, visualization |
+| `test-engineer` | all crates | orange | Test design, execution, coverage, regression |
+| `claude-config-optimizer` | .claude/ | cyan | Meta: agents, memory, skills, config |
+
+### Parallelization Rules
+- **Always launch independent agents in a single message** (multiple Agent tool calls). Never serialize what can run concurrently.
+- **Crate boundaries are parallelism boundaries.** Changes to `flowcus-ipfix` and `flowcus-query` can always run in parallel. Changes to `flowcus-storage` may conflict with both.
+- **Code + test = two agents.** After a code agent writes, launch `test-engineer` immediately. Don't wait for user confirmation.
+- **Multi-crate tasks:** Split into per-crate agents. Example: "add a new IE type" → `ipfix-ingestion-engine` (wire parsing) + `storage-integrity-engineer` (column type) + `test-engineer` (both crates) — all launched in one message.
+
+### Output Contract (all agents)
+Every agent must return results in this structure so the orchestrator can reliably parse and relay them:
+1. **Status**: `DONE` | `BLOCKED` | `NEEDS_REVIEW` — first word of the response
+2. **Summary**: 1-3 sentence description of what was accomplished or what's blocking
+3. **Files changed**: List of modified/created files with one-line description each
+4. **Tests**: Which tests were run and their pass/fail status (if applicable)
+5. **Follow-up**: Any remaining work or recommendations for other agents
+
+Agents should NOT repeat source code in their summary — the diff is visible. Keep it terse.
+
+### When NOT to Use Agents
+- Reading a single known file → `Read` tool directly
+- Searching for a specific symbol → `Grep` directly
+- Simple one-file edits → edit directly, no agent overhead
 
 ## Knowledge System
 Claude maintains structured knowledge in `.claude/knowledge/`:

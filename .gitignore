@@ -35,5 +35,6 @@ Thumbs.db
 # Test artifacts
 /coverage/
 /test-results/
+/artifacts/
 *.profraw
 *.profdata

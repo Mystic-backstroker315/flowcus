@@ -33,6 +33,9 @@ pub struct ServerConfig {
     pub dev_mode: bool,
     #[serde(default = "default_frontend_proxy")]
     pub frontend_proxy: String,
+    /// Maximum query result cache entries. Default 500.
+    #[serde(default = "default_query_cache_entries")]
+    pub query_cache_entries: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,14 +104,10 @@ pub struct StorageConfig {
     /// Bloom filter bits per granule (must be multiple of 64).
     #[serde(default = "default_bloom_bits_per_granule")]
     pub bloom_bits_per_granule: usize,
-    /// LRU cache for granule marks (.mrk files). Marks are small and always
-    /// needed for seeks — keep hot. Default 1 GB.
-    #[serde(default = "default_mark_cache_bytes")]
-    pub mark_cache_bytes: usize,
-    /// LRU cache for bloom filters (.bloom files). Blooms are larger and only
-    /// needed for point/equality queries. Default 1 GB.
-    #[serde(default = "default_bloom_cache_bytes")]
-    pub bloom_cache_bytes: usize,
+    /// Unified LRU cache for decoded columns, bloom filters, marks, metadata.
+    /// Default 1 GB.
+    #[serde(default = "default_storage_cache_bytes")]
+    pub storage_cache_bytes: usize,
 }
 
 fn default_storage_dir() -> String {
@@ -159,11 +158,7 @@ const fn default_bloom_bits_per_granule() -> usize {
     8192 // 1 KB per granule, ~1% FPR for up to ~800 distinct values
 }
 
-const fn default_mark_cache_bytes() -> usize {
-    1024 * 1024 * 1024 // 1 GB
-}
-
-const fn default_bloom_cache_bytes() -> usize {
+const fn default_storage_cache_bytes() -> usize {
     1024 * 1024 * 1024 // 1 GB
 }
 
@@ -182,8 +177,7 @@ impl Default for StorageConfig {
             merge_mem_throttle: default_merge_mem_throttle(),
             granule_size: default_granule_size(),
             bloom_bits_per_granule: default_bloom_bits_per_granule(),
-            mark_cache_bytes: default_mark_cache_bytes(),
-            bloom_cache_bytes: default_bloom_cache_bytes(),
+            storage_cache_bytes: default_storage_cache_bytes(),
         }
     }
 }
@@ -245,6 +239,10 @@ impl Default for LoggingConfig {
     }
 }
 
+const fn default_query_cache_entries() -> usize {
+    500
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -252,6 +250,7 @@ impl Default for ServerConfig {
             port: default_server_port(),
             dev_mode: false,
             frontend_proxy: default_frontend_proxy(),
+            query_cache_entries: default_query_cache_entries(),
         }
     }
 }

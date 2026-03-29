@@ -84,7 +84,7 @@ use std::path::{Path, PathBuf};
 use tracing::debug;
 
 use crate::codec::EncodedColumn;
-use crate::granule::{self, GranuleBloom, GranuleMark};
+use crate::granule::{self, GranuleBloom, GranuleMark, GranuleStats};
 use crate::schema::{ColumnDef, Schema, StorageType};
 
 // ---- Constants ----
@@ -99,6 +99,11 @@ pub const META_HEADER_SIZE: usize = 256;
 pub const COLUMN_INDEX_ENTRY_SIZE: usize = 64;
 pub const COLUMN_INDEX_MAGIC: &[u8; 4] = b"FCIX";
 pub const SCHEMA_MAGIC: &[u8; 4] = b"FSCH";
+
+/// Current part format version. Encoded in directory name as `v{N}_...`.
+/// - v0 (implicit, no prefix): original format without `.stats` files.
+/// - v1: adds per-column `.stats` files with pre-computed granule aggregates.
+pub const PART_FORMAT_VERSION: u32 = 1;
 
 // ---- Part metadata ----
 
@@ -132,14 +137,15 @@ pub fn hour_partition_dir(base: &Path, unix_secs: u32) -> PathBuf {
         .join(format!("{hour:02}"))
 }
 
-/// Build the part directory name: `{gen:05}_{min}_{max}_{seq:06}`
+/// Build the part directory name: `{ver}_{gen:05}_{min}_{max}_{seq:06}`
 ///
-/// Encoding generation + min/max timestamps in the name enables:
+/// Encoding format version + generation + min/max timestamps enables:
+/// - Format version detection by readdir (migration decisions without file open)
 /// - Time range skip by readdir (no file open needed)
 /// - Merge candidate grouping by generation
 /// - Lexicographic sort within a generation = chronological order
 pub fn part_dir_name(generation: u32, time_min: u32, time_max: u32, seq: u32) -> String {
-    format!("{generation:05}_{time_min}_{time_max}_{seq:06}")
+    format!("{PART_FORMAT_VERSION}_{generation:05}_{time_min}_{time_max}_{seq:06}")
 }
 
 /// Resolve full path for a part: `{base}/{YYYY}/{MM}/{DD}/{HH}/{part_name}/`
@@ -149,19 +155,40 @@ pub fn part_path(base: &Path, time_min: u32, generation: u32, time_max: u32, seq
     hour_dir.join(name)
 }
 
-/// Parse generation, min_ts, max_ts from a part directory name.
-/// Returns None if the name doesn't match the expected format.
+/// Parse a part directory name. Handles both versioned and legacy formats:
+/// - Versioned: `{ver}_{gen:05}_{min}_{max}_{seq:06}` → 5 segments
+/// - Legacy:    `{gen:05}_{min}_{max}_{seq:06}`        → 4 segments (version 0)
+///
+/// Returns `None` if the name doesn't match either format.
 pub fn parse_part_dir_name(name: &str) -> Option<(u32, u32, u32, u32)> {
-    // {gen:05}_{min}_{max}_{seq:06}
+    let (_, generation, min, max, seq) = parse_part_dir_name_versioned(name)?;
+    Some((generation, min, max, seq))
+}
+
+/// Parse with format version. Returns `(format_version, generation, min_ts, max_ts, seq)`.
+pub fn parse_part_dir_name_versioned(name: &str) -> Option<(u32, u32, u32, u32, u32)> {
     let parts: Vec<&str> = name.split('_').collect();
-    if parts.len() != 4 {
-        return None;
+
+    // Versioned format: {ver}_{gen}_{min}_{max}_{seq} — 5 segments
+    if parts.len() == 5 {
+        let version: u32 = parts[0].parse().ok()?;
+        let generation = parts[1].parse().ok()?;
+        let min_ts = parts[2].parse().ok()?;
+        let max_ts = parts[3].parse().ok()?;
+        let seq = parts[4].parse().ok()?;
+        return Some((version, generation, min_ts, max_ts, seq));
     }
-    let generation = parts[0].parse().ok()?;
-    let min_ts = parts[1].parse().ok()?;
-    let max_ts = parts[2].parse().ok()?;
-    let seq = parts[3].parse().ok()?;
-    Some((generation, min_ts, max_ts, seq))
+
+    // Legacy format: {gen}_{min}_{max}_{seq} — 4 segments, version 0
+    if parts.len() == 4 {
+        let generation = parts[0].parse().ok()?;
+        let min_ts = parts[1].parse().ok()?;
+        let max_ts = parts[2].parse().ok()?;
+        let seq = parts[3].parse().ok()?;
+        return Some((0, generation, min_ts, max_ts, seq));
+    }
+
+    None
 }
 
 // ---- Writing ----
@@ -172,6 +199,7 @@ pub struct ColumnWriteData {
     pub encoded: EncodedColumn,
     pub marks: Vec<GranuleMark>,
     pub blooms: Vec<GranuleBloom>,
+    pub stats: Vec<GranuleStats>,
 }
 
 /// Write a complete part to disk including column data, marks, bloom filters.
@@ -212,6 +240,11 @@ pub fn write_part(
             &col_dir.join(format!("{name}.bloom")),
             &cwd.blooms,
             bloom_bits,
+        )?;
+        granule::write_stats(
+            &col_dir.join(format!("{name}.stats")),
+            &cwd.stats,
+            cwd.def.storage_type,
         )?;
     }
 
@@ -486,7 +519,10 @@ pub fn read_schema_bin(path: &Path) -> std::io::Result<Schema> {
         });
     }
 
-    Ok(Schema { columns })
+    Ok(Schema {
+        columns,
+        duration_source: None,
+    })
 }
 
 /// FNV-1a 32-bit hash for column name lookup.
@@ -728,6 +764,18 @@ pub fn list_columns(part_dir: &Path) -> std::io::Result<Vec<String>> {
     Ok(names)
 }
 
+/// List column names from schema.bin (avoids readdir on columns/ directory).
+///
+/// Falls back to `list_columns` (readdir) if schema.bin doesn't exist.
+pub fn list_columns_from_index(part_dir: &Path) -> std::io::Result<Vec<String>> {
+    let schema_path = part_dir.join("schema.bin");
+    if schema_path.exists() {
+        let schema = read_schema_bin(&schema_path)?;
+        return Ok(schema.columns.into_iter().map(|c| c.name).collect());
+    }
+    list_columns(part_dir)
+}
+
 /// Remove a part directory entirely. Used after successful merge.
 pub fn remove_part(part_dir: &Path) -> std::io::Result<()> {
     tracing::debug!(path = %part_dir.display(), "Removing merged source part");
@@ -805,7 +853,8 @@ mod tests {
     #[test]
     fn part_dir_name_format() {
         let name = part_dir_name(0, 1_700_000_000, 1_700_003_599, 1);
-        assert_eq!(name, "00000_1700000000_1700003599_000001");
+        // Format: {version}_{gen:05}_{min}_{max}_{seq:06}
+        assert_eq!(name, "1_00000_1700000000_1700003599_000001");
     }
 
     #[test]
@@ -826,6 +875,29 @@ mod tests {
     fn parse_roundtrip() {
         let name = part_dir_name(2, 1_700_000_000, 1_700_003_599, 99);
         let (generation, min, max, seq) = parse_part_dir_name(&name).unwrap();
+        assert_eq!(generation, 2);
+        assert_eq!(min, 1_700_000_000);
+        assert_eq!(max, 1_700_003_599);
+        assert_eq!(seq, 99);
+    }
+
+    #[test]
+    fn parse_versioned_roundtrip() {
+        let name = part_dir_name(2, 1_700_000_000, 1_700_003_599, 99);
+        let (ver, generation, min, max, seq) = parse_part_dir_name_versioned(&name).unwrap();
+        assert_eq!(ver, PART_FORMAT_VERSION);
+        assert_eq!(generation, 2);
+        assert_eq!(min, 1_700_000_000);
+        assert_eq!(max, 1_700_003_599);
+        assert_eq!(seq, 99);
+    }
+
+    #[test]
+    fn parse_legacy_format() {
+        // Legacy v0 format: no version prefix, 4 segments
+        let name = "00002_1700000000_1700003599_000099";
+        let (ver, generation, min, max, seq) = parse_part_dir_name_versioned(name).unwrap();
+        assert_eq!(ver, 0);
         assert_eq!(generation, 2);
         assert_eq!(min, 1_700_000_000);
         assert_eq!(max, 1_700_003_599);
@@ -863,7 +935,10 @@ mod tests {
             column_count: 8,
             schema_fingerprint: 0xDEAD_BEEF_CAFE_1234,
             exporter: "10.0.0.1:4739".parse().unwrap(),
-            schema: Schema { columns: vec![] },
+            schema: Schema {
+                columns: vec![],
+                duration_source: None,
+            },
         };
 
         write_meta_bin(&dir.join("meta.bin"), &meta).unwrap();

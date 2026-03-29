@@ -6,6 +6,8 @@
 
 pub mod ast;
 pub mod parser;
+pub mod structured;
 
 pub use ast::Query;
 pub use parser::parse;
+pub use structured::StructuredQuery;

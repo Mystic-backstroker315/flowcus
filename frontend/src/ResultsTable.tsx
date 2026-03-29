@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Pagination, QueryColumn } from './api';
+import { getFormatter, getColumnLabel, selectVisibleColumns } from './formatters';
+import { ColumnConfig } from './ColumnConfig';
 
 interface ResultsTableProps {
   columns: QueryColumn[];
@@ -7,6 +9,10 @@ interface ResultsTableProps {
   pagination?: Pagination | null;
   onLoadMore?: () => void;
   loadingMore?: boolean;
+  onRowSelect?: (index: number) => void;
+  selectedRow?: number | null;
+  visibleColumns?: string[] | null;
+  onColumnConfigChange?: (columns: string[]) => void;
 }
 
 type SortDir = 'asc' | 'desc' | null;
@@ -17,10 +23,32 @@ export function ResultsTable({
   pagination,
   onLoadMore,
   loadingMore,
+  onRowSelect,
+  selectedRow,
+  visibleColumns,
+  onColumnConfigChange,
 }: ResultsTableProps) {
   const [sortCol, setSortCol] = useState<number | null>(null);
   const [sortDir, setSortDir] = useState<SortDir>(null);
   const sentinelRef = useRef<HTMLDivElement | null>(null);
+
+  const visibleIndices = useMemo(() => {
+    if (visibleColumns && visibleColumns.length > 0) {
+      // Map visible column names to indices, filtering to those that exist in result
+      const nameToIndex = new Map(columns.map((c, i) => [c.name, i]));
+      const indices = visibleColumns
+        .map((name) => nameToIndex.get(name))
+        .filter((i): i is number => i !== undefined);
+      if (indices.length > 0) return indices;
+    }
+    return selectVisibleColumns(columns);
+  }, [columns, visibleColumns]);
+
+  // Derive the current visible column names for the config component
+  const visibleColumnNames = useMemo(
+    () => visibleIndices.map((i) => columns[i].name),
+    [visibleIndices, columns],
+  );
 
   const handleSort = useCallback(
     (colIndex: number) => {
@@ -52,10 +80,9 @@ export function ResultsTable({
     });
   }, [rows, sortCol, sortDir]);
 
-  // Infinite scroll: observe sentinel element at bottom of table
+  // Infinite scroll
   useEffect(() => {
     if (!sentinelRef.current || !onLoadMore) return;
-
     const observer = new IntersectionObserver(
       (entries) => {
         if (entries[0].isIntersecting && pagination?.has_more && !loadingMore) {
@@ -64,7 +91,6 @@ export function ResultsTable({
       },
       { threshold: 0.1 },
     );
-
     observer.observe(sentinelRef.current);
     return () => observer.disconnect();
   }, [onLoadMore, pagination?.has_more, loadingMore]);
@@ -81,6 +107,8 @@ export function ResultsTable({
     );
   }
 
+  const allVisible = visibleIndices.length === columns.length;
+
   const sortIndicator = (colIndex: number) => {
     if (sortCol !== colIndex || sortDir === null) return '';
     return sortDir === 'asc' ? ' \u25B2' : ' \u25BC';
@@ -91,60 +119,74 @@ export function ResultsTable({
       <table className="results-table">
         <thead>
           <tr>
-            {columns.map((col, i) => (
-              <th
-                key={col.name}
-                onClick={() => handleSort(i)}
-                className="results-th"
-                title={`${col.name} (${col.type}) — click to sort`}
-              >
-                {col.name}
-                <span className="sort-indicator">{sortIndicator(i)}</span>
+            {onColumnConfigChange && (
+              <th className="results-th results-th-config">
+                <ColumnConfig
+                  columns={columns}
+                  visibleColumns={visibleColumnNames}
+                  onChange={onColumnConfigChange}
+                />
               </th>
-            ))}
+            )}
+            {visibleIndices.map((ci) => {
+              const col = columns[ci];
+              return (
+                <th
+                  key={col.name}
+                  onClick={() => handleSort(ci)}
+                  className="results-th"
+                  title={`${col.name} (${col.type}) \u2014 click to sort`}
+                >
+                  {getColumnLabel(col.name)}
+                  <span className="sort-indicator">{sortIndicator(ci)}</span>
+                </th>
+              );
+            })}
+            {!allVisible && !onColumnConfigChange && <th className="results-th results-th-more">&hellip;</th>}
           </tr>
         </thead>
         <tbody>
-          {sortedRows.map((row, ri) => (
-            <tr key={ri}>
-              {row.map((cell, ci) => (
-                <td key={ci} className="results-td">
-                  {formatCell(cell)}
-                </td>
-              ))}
-            </tr>
-          ))}
+          {sortedRows.map((row, ri) => {
+            const isSelected = selectedRow === ri;
+            return (
+              <tr
+                key={ri}
+                className={`results-row ${isSelected ? 'selected' : ''}`}
+                onClick={() => onRowSelect?.(ri)}
+              >
+                {onColumnConfigChange && <td className="results-td results-td-config" />}
+                {visibleIndices.map((ci) => {
+                  const col = columns[ci];
+                  const formatter = getFormatter(col.name);
+                  return (
+                    <td key={ci} className="results-td">
+                      {formatter(row[ci])}
+                    </td>
+                  );
+                })}
+                {!allVisible && !onColumnConfigChange && (
+                  <td className="results-td results-td-more">
+                    +{columns.length - visibleIndices.length}
+                  </td>
+                )}
+              </tr>
+            );
+          })}
         </tbody>
       </table>
 
-      {/* Infinite scroll sentinel + status */}
       <div className="results-scroll-status">
         {loadingMore && <div className="scroll-loading">Loading more rows...</div>}
         {pagination && (
           <div className="scroll-info">
             Showing {rows.length.toLocaleString()} of {pagination.total.toLocaleString()} rows
             {pagination.has_more && !loadingMore && (
-              <span className="scroll-hint"> — scroll down for more</span>
+              <span className="scroll-hint"> &mdash; scroll down for more</span>
             )}
           </div>
         )}
-        {/* Invisible sentinel that triggers loading when scrolled into view */}
         <div ref={sentinelRef} className="scroll-sentinel" />
       </div>
     </div>
   );
-}
-
-function formatCell(value: unknown): string {
-  if (value === null || value === undefined) return '\u2014';
-  if (typeof value === 'number') {
-    if (Number.isInteger(value) && Math.abs(value) >= 1000) {
-      return value.toLocaleString();
-    }
-    if (!Number.isInteger(value)) {
-      return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
-    }
-    return String(value);
-  }
-  return String(value);
 }

@@ -15,6 +15,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 use flowcus_ipfix::protocol::*;
+use flowcus_storage::cache::StorageCache;
 use flowcus_storage::granule;
 use flowcus_storage::part;
 use flowcus_storage::schema::StorageType;
@@ -632,5 +633,266 @@ fn test_marks_granule_coverage() {
     // First mark starts at row 0
     assert_eq!(marks[0].row_start, 0, "first granule must start at row 0");
 
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 9. test_cache_marks_hit_returns_same_data
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cache_marks_hit_returns_same_data() {
+    let dir = test_dir("cache_marks_hit");
+    let records = vec![
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 1),
+            1500,
+        ),
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(192, 168, 1, 2),
+            2500,
+        ),
+    ];
+    let part_dir = ingest_and_flush(&dir, records);
+    let cache = StorageCache::default();
+    let mrk_path = part_dir.join("columns").join("sourceIPv4Address.mrk");
+
+    let (gs_miss, marks_miss, was_cached) = cache.get_marks(&mrk_path).unwrap();
+    assert!(!was_cached, "first read must be a miss");
+
+    let (gs_hit, marks_hit, was_cached) = cache.get_marks(&mrk_path).unwrap();
+    assert!(was_cached, "second read must be a hit");
+
+    assert_eq!(gs_miss, gs_hit, "granule_size must match");
+    assert_eq!(marks_miss.len(), marks_hit.len(), "mark count must match");
+    for (a, b) in marks_miss.iter().zip(marks_hit.iter()) {
+        assert_eq!(a.row_start, b.row_start);
+        assert_eq!(a.row_count, b.row_count);
+        assert_eq!(a.min_value, b.min_value);
+        assert_eq!(a.max_value, b.max_value);
+    }
+
+    let (hits, misses) = cache.stats();
+    assert_eq!(hits, 1);
+    assert_eq!(misses, 1);
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 10. test_cache_bloom_hit_returns_same_data
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cache_bloom_hit_returns_same_data() {
+    let dir = test_dir("cache_bloom_hit");
+    let records = vec![
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 1),
+            100,
+        ),
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(192, 168, 1, 2),
+            200,
+        ),
+    ];
+    let part_dir = ingest_and_flush(&dir, records);
+    let cache = StorageCache::default();
+    let bloom_path = part_dir.join("columns").join("sourceIPv4Address.bloom");
+
+    let (bits_miss, blooms_miss, was_cached) = cache.get_blooms(&bloom_path).unwrap();
+    assert!(!was_cached, "first read must be a miss");
+
+    let (bits_hit, blooms_hit, was_cached) = cache.get_blooms(&bloom_path).unwrap();
+    assert!(was_cached, "second read must be a hit");
+
+    assert_eq!(bits_miss, bits_hit);
+    assert_eq!(blooms_miss.len(), blooms_hit.len());
+    for (a, b) in blooms_miss.iter().zip(blooms_hit.iter()) {
+        assert_eq!(a.bits, b.bits);
+    }
+
+    let (hits, misses) = cache.stats();
+    assert_eq!(hits, 1);
+    assert_eq!(misses, 1);
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 11. test_cache_meta_hit_returns_same_data
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cache_meta_hit_returns_same_data() {
+    let dir = test_dir("cache_meta_hit");
+    let records = vec![make_record(
+        Ipv4Addr::new(10, 0, 0, 1),
+        Ipv4Addr::new(192, 168, 1, 1),
+        100,
+    )];
+    let part_dir = ingest_and_flush(&dir, records);
+    let cache = StorageCache::default();
+    let meta_path = part_dir.join("meta.bin");
+
+    let (meta_miss, was_cached) = cache.get_meta(&meta_path).unwrap();
+    assert!(!was_cached, "first meta read must be a miss");
+
+    let (meta_hit, was_cached) = cache.get_meta(&meta_path).unwrap();
+    assert!(was_cached, "second meta read must be a hit");
+
+    assert_eq!(meta_miss.row_count, meta_hit.row_count);
+    assert_eq!(meta_miss.column_count, meta_hit.column_count);
+    assert_eq!(meta_miss.time_min, meta_hit.time_min);
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 12. test_cache_invalidate_after_part_delete
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cache_invalidate_after_part_delete() {
+    let dir = test_dir("cache_invalidate_delete");
+    let records = vec![make_record(
+        Ipv4Addr::new(10, 0, 0, 1),
+        Ipv4Addr::new(192, 168, 1, 1),
+        1000,
+    )];
+    let part_dir = ingest_and_flush(&dir, records);
+    let cache = StorageCache::default();
+
+    let bloom_path = part_dir.join("columns").join("sourceIPv4Address.bloom");
+    let _ = cache.get_blooms(&bloom_path).unwrap();
+    let (_, _, was_cached) = cache.get_blooms(&bloom_path).unwrap();
+    assert!(was_cached, "must be cached");
+
+    std::fs::remove_dir_all(&part_dir).unwrap();
+    cache.invalidate_part(&part_dir);
+
+    let result = cache.get_blooms(&bloom_path);
+    assert!(result.is_err(), "must fail after delete + invalidation");
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 13. test_cache_invalidate_part_clears_all_types
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cache_invalidate_part_clears_all_types() {
+    let dir = test_dir("cache_invalidate_all_types");
+    let records = vec![make_record(
+        Ipv4Addr::new(10, 0, 0, 1),
+        Ipv4Addr::new(192, 168, 1, 1),
+        500,
+    )];
+    let part_dir = ingest_and_flush(&dir, records);
+    let cache = StorageCache::default();
+
+    let bloom_path = part_dir.join("columns").join("sourceIPv4Address.bloom");
+    let mrk_path = part_dir.join("columns").join("sourceIPv4Address.mrk");
+    let meta_path = part_dir.join("meta.bin");
+
+    let _ = cache.get_blooms(&bloom_path).unwrap();
+    let _ = cache.get_marks(&mrk_path).unwrap();
+    let _ = cache.get_meta(&meta_path).unwrap();
+
+    let (hits_before, _) = cache.stats();
+    cache.invalidate_part(&part_dir);
+
+    // All re-reads must be misses
+    let (_, _, c1) = cache.get_blooms(&bloom_path).unwrap();
+    let (_, _, c2) = cache.get_marks(&mrk_path).unwrap();
+    let (_, c3) = cache.get_meta(&meta_path).unwrap();
+    assert!(
+        !c1 && !c2 && !c3,
+        "all reads after invalidation must be misses"
+    );
+
+    let (hits_after, _) = cache.stats();
+    assert_eq!(
+        hits_after, hits_before,
+        "invalidation must not produce hits"
+    );
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 14. test_cache_partitions_are_independent
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cache_partitions_are_independent() {
+    let dir = test_dir("cache_partitions_independent");
+    let records = vec![make_record(
+        Ipv4Addr::new(10, 0, 0, 1),
+        Ipv4Addr::new(192, 168, 1, 1),
+        100,
+    )];
+    let part_dir = ingest_and_flush(&dir, records);
+
+    // Tiny cache: marks/blooms each get ~50 bytes. Should evict within their pool
+    // but not affect each other.
+    let cache = StorageCache::new(200);
+    let bloom_path = part_dir.join("columns").join("sourceIPv4Address.bloom");
+    let mrk_path = part_dir.join("columns").join("sourceIPv4Address.mrk");
+    let meta_path = part_dir.join("meta.bin");
+
+    // All reads must succeed despite tiny budget — each type has its own pool
+    assert!(cache.get_blooms(&bloom_path).is_ok());
+    assert!(cache.get_marks(&mrk_path).is_ok());
+    assert!(cache.get_meta(&meta_path).is_ok());
+    cleanup(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 15. test_cache_survives_concurrent_reads
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cache_survives_concurrent_reads() {
+    let dir = test_dir("cache_concurrent_reads");
+    let records = vec![
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 1),
+            Ipv4Addr::new(192, 168, 1, 1),
+            1500,
+        ),
+        make_record(
+            Ipv4Addr::new(10, 0, 0, 2),
+            Ipv4Addr::new(192, 168, 1, 2),
+            2500,
+        ),
+    ];
+    let part_dir = ingest_and_flush(&dir, records);
+    let cache = StorageCache::default();
+    let mrk_path = part_dir.join("columns").join("sourceIPv4Address.mrk");
+
+    std::thread::scope(|s| {
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let cache_ref = &cache;
+                let path_ref = &mrk_path;
+                s.spawn(move || cache_ref.get_marks(path_ref).unwrap())
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ref_len = results[0].1.len();
+        for (i, (_, marks, _)) in results.iter().enumerate() {
+            assert_eq!(
+                marks.len(),
+                ref_len,
+                "thread {i} returned different mark count"
+            );
+        }
+    });
+
+    let (hits, misses) = cache.stats();
+    assert_eq!(hits + misses, 8);
+    assert!(misses >= 1);
     cleanup(&dir);
 }

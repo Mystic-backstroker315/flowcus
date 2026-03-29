@@ -30,6 +30,8 @@ pub struct Table {
 #[derive(Debug, Clone)]
 pub struct PartEntry {
     pub path: PathBuf,
+    /// Part format version (0 = legacy without `.stats`, 1 = current with `.stats`).
+    pub format_version: u32,
     pub generation: u32,
     pub time_min: u32,
     pub time_max: u32,
@@ -107,7 +109,9 @@ fn walk_parts_recursive(
 
         if depth < 4 {
             walk_parts_recursive(&entry.path(), depth + 1, time_min, time_max, out)?;
-        } else if let Some((generation, pmin, pmax, seq)) = part::parse_part_dir_name(&name) {
+        } else if let Some((format_version, generation, pmin, pmax, seq)) =
+            part::parse_part_dir_name_versioned(&name)
+        {
             // Scan-limit: skip parts entirely outside the query range
             if let Some(qmax) = time_max {
                 if pmin > qmax {
@@ -122,6 +126,7 @@ fn walk_parts_recursive(
 
             out.push(PartEntry {
                 path: entry.path(),
+                format_version,
                 generation,
                 time_min: pmin,
                 time_max: pmax,

@@ -1,0 +1,191 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { StructuredTimeRange } from './api';
+
+interface TimeRangePickerProps {
+  value: StructuredTimeRange;
+  onChange: (range: StructuredTimeRange) => void;
+}
+
+const PRESETS: [string, string[]][] = [
+  ['', ['5s', '10s', '30s', '45s', '1m', '5m']],
+  ['', ['15m', '1h', '6h', '24h', '7d', '30d']],
+];
+const UNITS = [
+  { value: 's', label: 'seconds' },
+  { value: 'm', label: 'minutes' },
+  { value: 'h', label: 'hours' },
+  { value: 'd', label: 'days' },
+  { value: 'w', label: 'weeks' },
+] as const;
+
+function formatTimeRange(range: StructuredTimeRange): string {
+  if (range.type === 'relative') {
+    return `Last ${range.duration ?? '1h'}`;
+  }
+  if (range.start && range.end) {
+    const fmt = (iso: string) => {
+      const d = new Date(iso);
+      return d.toLocaleString(undefined, {
+        month: 'short', day: 'numeric',
+        hour: '2-digit', minute: '2-digit',
+      });
+    };
+    return `${fmt(range.start)} \u2014 ${fmt(range.end)}`;
+  }
+  return 'Custom range';
+}
+
+export function TimeRangePicker({ value, onChange }: TimeRangePickerProps) {
+  const [open, setOpen] = useState(false);
+  const [mode, setMode] = useState<'relative' | 'absolute'>(value.type);
+  const [customAmount, setCustomAmount] = useState('1');
+  const [customUnit, setCustomUnit] = useState('h');
+  const [absStart, setAbsStart] = useState('');
+  const [absEnd, setAbsEnd] = useState('');
+  const popoverRef = useRef<HTMLDivElement>(null);
+
+  // Close on outside click or Escape
+  useEffect(() => {
+    if (!open) return;
+    const handleClick = (e: MouseEvent) => {
+      if (popoverRef.current && !popoverRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const handleKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false);
+    };
+    document.addEventListener('mousedown', handleClick);
+    document.addEventListener('keydown', handleKey);
+    return () => {
+      document.removeEventListener('mousedown', handleClick);
+      document.removeEventListener('keydown', handleKey);
+    };
+  }, [open]);
+
+  const selectPreset = useCallback((duration: string) => {
+    onChange({ type: 'relative', duration });
+    setMode('relative');
+    setOpen(false);
+  }, [onChange]);
+
+  const applyCustomRelative = useCallback(() => {
+    const n = parseInt(customAmount, 10);
+    if (n > 0) {
+      onChange({ type: 'relative', duration: `${n}${customUnit}` });
+      setOpen(false);
+    }
+  }, [customAmount, customUnit, onChange]);
+
+  const applyAbsolute = useCallback(() => {
+    if (absStart && absEnd) {
+      onChange({
+        type: 'absolute',
+        start: new Date(absStart).toISOString(),
+        end: new Date(absEnd).toISOString(),
+      });
+      setOpen(false);
+    }
+  }, [absStart, absEnd, onChange]);
+
+  return (
+    <div className="time-range-picker" ref={popoverRef}>
+      <button
+        className="time-range-trigger"
+        onClick={() => setOpen(!open)}
+        title="Select time range"
+      >
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+          <path d="M8 3.5a.5.5 0 00-1 0V8a.5.5 0 00.252.434l3.5 2a.5.5 0 00.496-.868L8 7.71V3.5z"/>
+          <path d="M8 16A8 8 0 108 0a8 8 0 000 16zm7-8A7 7 0 111 8a7 7 0 0114 0z"/>
+        </svg>
+        <span className="time-range-label">{formatTimeRange(value)}</span>
+        <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor" style={{ opacity: 0.5 }}>
+          <path d="M4.427 7.427l3.396 3.396a.25.25 0 00.354 0l3.396-3.396A.25.25 0 0011.396 7H4.604a.25.25 0 00-.177.427z"/>
+        </svg>
+      </button>
+
+      {open && (
+        <div className="time-range-popover">
+          <div className="time-range-mode-tabs">
+            <button
+              className={mode === 'relative' ? 'active' : ''}
+              onClick={() => setMode('relative')}
+            >Relative</button>
+            <button
+              className={mode === 'absolute' ? 'active' : ''}
+              onClick={() => setMode('absolute')}
+            >Absolute</button>
+          </div>
+
+          {mode === 'relative' && (
+            <div className="time-range-relative">
+              <div className="time-range-presets">
+                {PRESETS.map(([, items], rowIdx) => (
+                  <div key={rowIdx} className="time-range-preset-row">
+                    {items.map((p) => (
+                      <button
+                        key={p}
+                        className={`time-range-preset ${value.type === 'relative' && value.duration === p ? 'active' : ''}`}
+                        onClick={() => selectPreset(p)}
+                      >{p}</button>
+                    ))}
+                  </div>
+                ))}
+              </div>
+              <div className="time-range-custom">
+                <span className="time-range-custom-label">Custom:</span>
+                <input
+                  type="number"
+                  min="1"
+                  value={customAmount}
+                  onChange={(e) => setCustomAmount(e.target.value)}
+                  className="time-range-custom-input"
+                  onKeyDown={(e) => { if (e.key === 'Enter') applyCustomRelative(); }}
+                />
+                <select
+                  value={customUnit}
+                  onChange={(e) => setCustomUnit(e.target.value)}
+                  className="time-range-custom-unit"
+                >
+                  {UNITS.map((u) => (
+                    <option key={u.value} value={u.value}>{u.label}</option>
+                  ))}
+                </select>
+                <button className="time-range-apply" onClick={applyCustomRelative}>Apply</button>
+              </div>
+            </div>
+          )}
+
+          {mode === 'absolute' && (
+            <div className="time-range-absolute">
+              <label className="time-range-abs-label">
+                Start
+                <input
+                  type="datetime-local"
+                  value={absStart}
+                  onChange={(e) => setAbsStart(e.target.value)}
+                  className="time-range-abs-input"
+                />
+              </label>
+              <label className="time-range-abs-label">
+                End
+                <input
+                  type="datetime-local"
+                  value={absEnd}
+                  onChange={(e) => setAbsEnd(e.target.value)}
+                  className="time-range-abs-input"
+                />
+              </label>
+              <button
+                className="time-range-apply"
+                onClick={applyAbsolute}
+                disabled={!absStart || !absEnd}
+              >Apply</button>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

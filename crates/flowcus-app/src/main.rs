@@ -111,6 +111,13 @@ async fn main() -> Result<()> {
         "Storage engine ready"
     );
 
+    // Migrate old-format parts in background (v0 → v1: adds .stats files)
+    flowcus_storage::migrate::start_background_migration(
+        table_base.clone(),
+        config.storage.granule_size,
+        config.storage.bloom_bits_per_granule,
+    );
+
     // Background merge
     let merge_config = MergeConfig {
         workers: config.storage.merge_workers,
@@ -130,6 +137,7 @@ async fn main() -> Result<()> {
         Arc::clone(&metrics),
         &config.storage.dir,
     );
+    let session_store = ipfix.session_store();
     tokio::spawn(async move {
         if let Err(e) = ipfix.run().await {
             error!(error = %e, "IPFIX listener failed");
@@ -142,8 +150,8 @@ async fn main() -> Result<()> {
         "IPFIX collector running"
     );
 
-    // HTTP server with observability endpoint
-    let state = AppState::new(config.clone(), metrics);
+    // HTTP server with observability endpoint (shares IPFIX session for metadata API)
+    let state = AppState::with_session_store(config.clone(), metrics, session_store);
     flowcus_server::serve(&config.server, state).await?;
 
     Ok(())

@@ -31,3 +31,5 @@ predicates = { workspace = true }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
+flowcus-ipfix = { workspace = true }
+flowcus-storage = { workspace = true }

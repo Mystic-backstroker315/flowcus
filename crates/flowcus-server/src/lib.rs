@@ -19,12 +19,17 @@ pub fn build_router(state: AppState) -> Router {
     let api_routes = api::routes().merge(query::routes());
     let obs_routes = api::observability_routes();
 
+    // SSE endpoints must not be compressed — compression buffers the entire
+    // response body, preventing streaming. Mount them outside the compression
+    // layer.
+    let sse_routes = query::sse_routes();
+
     Router::new()
-        .nest("/api", api_routes)
-        .nest("/observability", obs_routes)
+        .nest("/api", sse_routes)
+        .nest("/api", api_routes.layer(CompressionLayer::new()))
+        .nest("/observability", obs_routes.layer(CompressionLayer::new()))
         .fallback(assets::static_handler)
         .layer(TraceLayer::new_for_http())
-        .layer(CompressionLayer::new())
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

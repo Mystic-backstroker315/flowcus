@@ -22,6 +22,7 @@ tower = { workspace = true }
 tower-http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+futures-core = { workspace = true }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
 tracing = { workspace = true }

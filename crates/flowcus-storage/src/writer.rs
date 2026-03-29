@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use tracing::{debug, info, warn};
 
-use crate::schema::system_columns;
+use crate::schema::DurationSource;
 use flowcus_ipfix::protocol::{DataRecord, IpfixMessage, SetContents};
 
 use crate::codec;
@@ -92,12 +92,20 @@ impl SchemaBuffer {
         export_time: u32,
         observation_domain_id: u32,
     ) {
-        let num_sys = system_columns().len();
+        let num_sys = self.schema.system_column_count();
         // Push system column values into the first 4 column buffers.
         self.columns[0].push_u32(exporter_ipv4);
         self.columns[1].push_u16(exporter_port);
         self.columns[2].push_u32(export_time);
         self.columns[3].push_u32(observation_domain_id);
+
+        // Compute and push flow duration if this schema has the column.
+        if let Some(src) = self.schema.duration_source {
+            let duration_ms = compute_duration_ms(src, &record.fields);
+            // Duration column is at index 4 (right after the 4 base system columns).
+            self.columns[4].push_u32(duration_ms);
+        }
+
         // Push template field values into the remaining column buffers.
         for (col_buf, field) in self.columns[num_sys..].iter_mut().zip(record.fields.iter()) {
             col_buf.push(&field.value);
@@ -165,7 +173,22 @@ impl StorageWriter {
     pub fn ingest(&mut self, msg: &IpfixMessage) -> usize {
         let exporter = msg.exporter;
         let domain = msg.header.observation_domain_id;
-        let export_time = msg.header.export_time;
+        // Use the message's export_time, but fall back to wall clock if the
+        // exporter sends 0 (unconfigured clock) or an obviously wrong value
+        // (before 2000-01-01 = 946684800).
+        let export_time = if msg.header.export_time >= 946_684_800 {
+            msg.header.export_time
+        } else {
+            tracing::debug!(
+                original = msg.header.export_time,
+                exporter = %exporter,
+                "Exporter sent invalid export_time, using wall clock"
+            );
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as u32
+        };
         let partition = export_time / self.config.partition_duration_secs;
 
         // Extract exporter IPv4 address and port from the socket address.
@@ -175,7 +198,6 @@ impl StorageWriter {
         };
         let exporter_port = exporter.port();
 
-        let num_sys = system_columns().len();
         let mut total = 0;
 
         for set in &msg.sets {
@@ -206,6 +228,7 @@ impl StorageWriter {
                 }
 
                 // Record fields should match the non-system columns in the schema.
+                let num_sys = buf.schema.system_column_count();
                 let expected_fields = buf.schema.columns.len() - num_sys;
                 for record in &data.records {
                     if record.fields.len() == expected_fields {
@@ -306,6 +329,63 @@ impl StorageWriter {
     }
 }
 
+/// Compute flow duration in milliseconds from the start/end field pair.
+///
+/// Returns 0 if the fields are missing or end < start (e.g. counter wrap on
+/// sysUpTime). Saturating arithmetic prevents overflow; the result is clamped
+/// to `u32::MAX` (~49.7 days) which is more than sufficient.
+fn compute_duration_ms(src: DurationSource, fields: &[flowcus_ipfix::protocol::DataField]) -> u32 {
+    match src {
+        DurationSource::Seconds { start_idx, end_idx } => {
+            let start = extract_seconds(&fields[start_idx].value);
+            let end = extract_seconds(&fields[end_idx].value);
+            end.saturating_sub(start).saturating_mul(1000)
+        }
+        DurationSource::Milliseconds { start_idx, end_idx } => {
+            let start = extract_millis(&fields[start_idx].value);
+            let end = extract_millis(&fields[end_idx].value);
+            // Difference of u64 timestamps, clamped to u32.
+            let diff = end.saturating_sub(start);
+            u32::try_from(diff).unwrap_or(u32::MAX)
+        }
+        DurationSource::SysUpTime { start_idx, end_idx } => {
+            let start = extract_uptime(&fields[start_idx].value);
+            let end = extract_uptime(&fields[end_idx].value);
+            end.saturating_sub(start)
+        }
+    }
+}
+
+/// Extract a seconds-precision timestamp (IE 150/151: `DateTimeSeconds`).
+fn extract_seconds(v: &flowcus_ipfix::protocol::FieldValue) -> u32 {
+    use flowcus_ipfix::protocol::FieldValue;
+    match v {
+        FieldValue::DateTimeSeconds(x) => *x,
+        FieldValue::Unsigned32(x) => *x,
+        _ => 0,
+    }
+}
+
+/// Extract a millisecond-precision timestamp (IE 152/153: `DateTimeMilliseconds`).
+fn extract_millis(v: &flowcus_ipfix::protocol::FieldValue) -> u64 {
+    use flowcus_ipfix::protocol::FieldValue;
+    match v {
+        FieldValue::DateTimeMilliseconds(x) => *x,
+        FieldValue::Unsigned64(x) => *x,
+        _ => 0,
+    }
+}
+
+/// Extract sysUpTime (IE 21/22: `Unsigned32`, already in milliseconds).
+fn extract_uptime(v: &flowcus_ipfix::protocol::FieldValue) -> u32 {
+    use flowcus_ipfix::protocol::FieldValue;
+    match v {
+        FieldValue::Unsigned32(x) => *x,
+        FieldValue::DateTimeSeconds(x) => *x,
+        _ => 0,
+    }
+}
+
 /// Default granule size used during ingestion flush.
 const INGESTION_GRANULE_SIZE: usize = 8192;
 /// Default bloom bits per granule during ingestion.
@@ -323,7 +403,7 @@ fn flush_schema_buffer(buf: &SchemaBuffer, base_dir: &Path, seq: u32) -> std::io
         disk_bytes += (part::COLUMN_HEADER_SIZE + encoded.data.len()) as u64;
 
         let _t_gran = flowcus_core::profiling::span_timer("storage;writer;flush;compute_granules");
-        let (marks, blooms) = crate::granule::compute_granules(
+        let (marks, blooms, stats) = crate::granule::compute_granules(
             col_buf,
             &encoded.data,
             INGESTION_GRANULE_SIZE,
@@ -336,6 +416,7 @@ fn flush_schema_buffer(buf: &SchemaBuffer, base_dir: &Path, seq: u32) -> std::io
             encoded,
             marks,
             blooms,
+            stats,
         });
     }
 
@@ -519,5 +600,217 @@ mod tests {
         assert_eq!(flushed, 2, "should produce 2 parts for 2 different hours");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Build a record with flowStartMilliseconds (IE 152) and flowEndMilliseconds (IE 153).
+    fn make_record_with_ms_times(start_ms: u64, end_ms: u64, bytes: u64) -> DataRecord {
+        DataRecord {
+            fields: vec![
+                DataField {
+                    spec: FieldSpecifier {
+                        element_id: 8,
+                        field_length: 4,
+                        enterprise_id: 0,
+                    },
+                    name: "sourceIPv4Address".into(),
+                    value: FieldValue::Ipv4(Ipv4Addr::new(10, 0, 0, 1)),
+                },
+                DataField {
+                    spec: FieldSpecifier {
+                        element_id: 152,
+                        field_length: 8,
+                        enterprise_id: 0,
+                    },
+                    name: "flowStartMilliseconds".into(),
+                    value: FieldValue::DateTimeMilliseconds(start_ms),
+                },
+                DataField {
+                    spec: FieldSpecifier {
+                        element_id: 153,
+                        field_length: 8,
+                        enterprise_id: 0,
+                    },
+                    name: "flowEndMilliseconds".into(),
+                    value: FieldValue::DateTimeMilliseconds(end_ms),
+                },
+                DataField {
+                    spec: FieldSpecifier {
+                        element_id: 1,
+                        field_length: 8,
+                        enterprise_id: 0,
+                    },
+                    name: "octetDeltaCount".into(),
+                    value: FieldValue::Unsigned64(bytes),
+                },
+            ],
+        }
+    }
+
+    fn make_message_from_records(records: Vec<DataRecord>) -> IpfixMessage {
+        IpfixMessage {
+            header: MessageHeader {
+                version: 0x000a,
+                length: 0,
+                export_time: 1_700_000_000,
+                sequence_number: 1,
+                observation_domain_id: 1,
+            },
+            exporter: "10.0.0.1:4739".parse().unwrap(),
+            sets: vec![Set {
+                set_id: 256,
+                contents: SetContents::Data(DataSet {
+                    template_id: 256,
+                    records,
+                }),
+            }],
+        }
+    }
+
+    #[test]
+    fn ingest_computes_flow_duration_ms() {
+        let dir = std::env::temp_dir().join("flowcus_test_duration_ms");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let table = Table::open(&dir, "flows").unwrap();
+        let config = WriterConfig {
+            flush_bytes: 1,
+            flush_interval_secs: 0,
+            initial_row_capacity: 64,
+            ..WriterConfig::default()
+        };
+        let mut writer = StorageWriter::new(table, config, None);
+
+        let start_ms = 1_700_000_000_000u64;
+        let end_ms = 1_700_000_005_432u64; // 5432 ms later
+        let msg =
+            make_message_from_records(vec![make_record_with_ms_times(start_ms, end_ms, 1500)]);
+
+        assert_eq!(writer.ingest(&msg), 1);
+
+        // Check the schema has the duration column
+        let buf = writer.buffers.values().next().unwrap();
+        assert_eq!(buf.schema.columns[4].name, "flowcusFlowDuration");
+        // 4 base sys + 1 duration + 4 template = 9
+        assert_eq!(buf.schema.columns.len(), 9);
+        assert_eq!(buf.schema.system_column_count(), 5);
+
+        // Verify the computed duration value in the buffer
+        match &buf.columns[4] {
+            crate::column::ColumnBuffer::U32(vals) => {
+                assert_eq!(vals[0], 5432);
+            }
+            _ => panic!("duration column should be U32"),
+        }
+
+        // Flush and verify part on disk
+        assert_eq!(writer.flush_all(), 1);
+        let table = Table::open(&dir, "flows").unwrap();
+        let parts = table.list_all_parts().unwrap();
+        assert_eq!(parts.len(), 1);
+
+        let header = part::read_meta_bin(&parts[0].path.join("meta.bin")).unwrap();
+        assert_eq!(header.column_count, 9); // 5 system + 4 template
+        assert!(
+            parts[0]
+                .path
+                .join("columns")
+                .join("flowcusFlowDuration.col")
+                .exists()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn duration_seconds_multiplied_by_1000() {
+        use crate::schema::DurationSource;
+
+        let fields = vec![
+            flowcus_ipfix::protocol::DataField {
+                spec: FieldSpecifier {
+                    element_id: 150,
+                    field_length: 4,
+                    enterprise_id: 0,
+                },
+                name: "flowStartSeconds".into(),
+                value: FieldValue::DateTimeSeconds(1_700_000_000),
+            },
+            flowcus_ipfix::protocol::DataField {
+                spec: FieldSpecifier {
+                    element_id: 151,
+                    field_length: 4,
+                    enterprise_id: 0,
+                },
+                name: "flowEndSeconds".into(),
+                value: FieldValue::DateTimeSeconds(1_700_000_003),
+            },
+        ];
+        let src = DurationSource::Seconds {
+            start_idx: 0,
+            end_idx: 1,
+        };
+        assert_eq!(compute_duration_ms(src, &fields), 3000);
+    }
+
+    #[test]
+    fn duration_sysuptime_direct_ms() {
+        use crate::schema::DurationSource;
+
+        let fields = vec![
+            flowcus_ipfix::protocol::DataField {
+                spec: FieldSpecifier {
+                    element_id: 22,
+                    field_length: 4,
+                    enterprise_id: 0,
+                },
+                name: "flowStartSysUpTime".into(),
+                value: FieldValue::Unsigned32(10_000),
+            },
+            flowcus_ipfix::protocol::DataField {
+                spec: FieldSpecifier {
+                    element_id: 21,
+                    field_length: 4,
+                    enterprise_id: 0,
+                },
+                name: "flowEndSysUpTime".into(),
+                value: FieldValue::Unsigned32(15_500),
+            },
+        ];
+        let src = DurationSource::SysUpTime {
+            start_idx: 0,
+            end_idx: 1,
+        };
+        assert_eq!(compute_duration_ms(src, &fields), 5500);
+    }
+
+    #[test]
+    fn duration_zero_when_end_before_start() {
+        use crate::schema::DurationSource;
+
+        let fields = vec![
+            flowcus_ipfix::protocol::DataField {
+                spec: FieldSpecifier {
+                    element_id: 150,
+                    field_length: 4,
+                    enterprise_id: 0,
+                },
+                name: "flowStartSeconds".into(),
+                value: FieldValue::DateTimeSeconds(1_700_000_010),
+            },
+            flowcus_ipfix::protocol::DataField {
+                spec: FieldSpecifier {
+                    element_id: 151,
+                    field_length: 4,
+                    enterprise_id: 0,
+                },
+                name: "flowEndSeconds".into(),
+                value: FieldValue::DateTimeSeconds(1_700_000_005),
+            },
+        ];
+        let src = DurationSource::Seconds {
+            start_idx: 0,
+            end_idx: 1,
+        };
+        assert_eq!(compute_duration_ms(src, &fields), 0);
     }
 }

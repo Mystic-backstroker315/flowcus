@@ -3,15 +3,21 @@
 //! Execution pipeline:
 //! 1. Convert time range to unix second bounds
 //! 2. Discover parts via `Table::list_parts` with time pruning
-//! 3. For each part: read column index, check bloom/marks, decode columns, filter
+//! 3. For each part: decode filter columns, build matching-row bitmask,
+//!    decode output columns only for matches, build `Vec<Vec<Value>>` directly
 //! 4. Aggregate if needed (group-by, top-N)
-//! 5. Return results with execution plan
+//! 5. Early-terminate for non-aggregate queries once offset+limit rows collected
+//! 6. Return results with execution plan
 
-use std::collections::HashMap;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
+use rayon::prelude::*;
 use serde::Serialize;
 use tracing::{debug, trace};
+
+use flowcus_core::profiling::span_timer;
 
 use flowcus_query::ast::{
     AggCall, AggExpr, AggFunc, CompareOp, Duration as FqlDuration, DurationUnit, FieldFilter,
@@ -20,6 +26,9 @@ use flowcus_query::ast::{
     Query, SelectExpr, SelectFieldExpr, Stage, StringFilterExpr, StringOp, TimeRange,
 };
 
+use std::sync::Arc;
+
+use crate::cache::StorageCache;
 use crate::column::ColumnBuffer;
 use crate::decode;
 use crate::granule;
@@ -35,10 +44,11 @@ use crate::table::{PartEntry, Table};
 pub struct QueryExecutor {
     table_base: PathBuf,
     granule_size: usize,
+    cache: Arc<StorageCache>,
 }
 
 /// Execution plan with statistics about what happened during the query.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ExecutionPlan {
     pub steps: Vec<PlanStep>,
     pub parts_total: usize,
@@ -48,6 +58,8 @@ pub struct ExecutionPlan {
     pub granules_skipped_by_bloom: usize,
     pub granules_skipped_by_marks: usize,
     pub columns_to_read: Vec<String>,
+    /// Total bytes read from disk across all column reads.
+    pub bytes_read: u64,
 }
 
 /// A single step in the execution plan.
@@ -59,33 +71,40 @@ pub enum PlanStep {
         end: u32,
         parts_before: usize,
         parts_after: usize,
+        duration_us: Option<u64>,
     },
     ColumnIndexFilter {
         column: String,
         predicate: String,
         parts_skipped: usize,
+        duration_us: Option<u64>,
     },
     BloomFilter {
         column: String,
         value: String,
         granules_skipped: usize,
+        duration_us: Option<u64>,
     },
     MarkSeek {
         column: String,
         granule_range: (usize, usize),
+        duration_us: Option<u64>,
     },
     ColumnRead {
         column: String,
         bytes: u64,
+        duration_us: Option<u64>,
     },
     FilterApply {
         expression: String,
         rows_before: usize,
         rows_after: usize,
+        duration_us: Option<u64>,
     },
     Aggregate {
         function: String,
         groups: usize,
+        duration_us: Option<u64>,
     },
     PartSkippedMerge {
         path: String,
@@ -100,6 +119,26 @@ pub enum PlanStep {
         path: String,
         subsumed_by: String,
     },
+    StatsShortcut {
+        parts_used: usize,
+        duration_us: Option<u64>,
+    },
+    TopNFastPath {
+        sort_field: String,
+        n: usize,
+        parts_scanned: usize,
+        rows_scanned: u64,
+        duration_us: Option<u64>,
+    },
+    ParallelScan {
+        parts_count: usize,
+        duration_us: Option<u64>,
+    },
+    /// Summary of storage-level LRU cache usage for this query.
+    CacheStats {
+        hits: u64,
+        misses: u64,
+    },
 }
 
 /// Query result with rows, columns, and the execution plan.
@@ -110,6 +149,268 @@ pub struct QueryResult {
     pub rows_scanned: u64,
     pub parts_scanned: u64,
     pub parts_skipped: u64,
+    pub total_matching_rows: u64,
+    /// Sum of `row_count` from all part metadata in the time range (no column scan).
+    pub total_rows_in_range: u64,
+    pub time_start: u32,
+    pub time_end: u32,
+}
+
+/// Lightweight histogram built from part metadata only (no column scan).
+pub struct HistogramResult {
+    /// Time-bucketed row counts: (bucket_start_unix_seconds, row_count).
+    pub buckets: Vec<(u32, u64)>,
+    /// Total rows across all parts in the time range.
+    pub total_rows: u64,
+    /// Resolved time range bounds.
+    pub time_start: u32,
+    pub time_end: u32,
+}
+
+// ---------------------------------------------------------------------------
+// Pre-resolved filter types — parse constants once before the row loop
+// ---------------------------------------------------------------------------
+
+/// A filter with all constants pre-resolved to native types.
+/// Avoids repeated string parsing and name resolution inside per-row evaluation.
+enum ResolvedFilter {
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
+    Not(Box<Self>),
+    Ip(ResolvedIpFilter),
+    Port(ResolvedPortFilter),
+    Proto(ResolvedProtoFilter),
+    Numeric(ResolvedNumericFilter),
+    StringFilter(ResolvedStringFilter),
+    Field(ResolvedFieldFilter),
+}
+
+struct ResolvedIpFilter {
+    direction: IpDirection,
+    negated: bool,
+    value: ResolvedIpValue,
+}
+
+enum ResolvedIpValue {
+    Addr(u32),
+    Cidr { base_masked: u32, mask: u32 },
+    List(Vec<u32>),
+    Wildcard(WildcardOctets),
+}
+
+/// Pre-parsed wildcard octets: `None` means `*` (match any).
+struct WildcardOctets([Option<u8>; 4]);
+
+struct ResolvedPortFilter {
+    direction: PortDirection,
+    negated: bool,
+    value: ResolvedPortValue,
+}
+
+enum ResolvedPortValue {
+    Single(u16),
+    Range(u16, u16),
+    List(Vec<Self>),
+    OpenRange(u16),
+}
+
+struct ResolvedProtoFilter {
+    negated: bool,
+    value: ResolvedProtoValue,
+}
+
+enum ResolvedProtoValue {
+    Single(u8),
+    List(Vec<u8>),
+}
+
+struct ResolvedNumericFilter {
+    col_name: String,
+    op: CompareOp,
+    target: u64,
+}
+
+struct ResolvedStringFilter {
+    col_name: String,
+    op: StringOp,
+    value: String,
+    /// Pre-split list items for In/NotIn
+    list_items: Vec<String>,
+}
+
+struct ResolvedFieldFilter {
+    col_name: String,
+    op: CompareOp,
+    target: u64,
+}
+
+/// Resolve an AST filter tree into pre-computed native values.
+fn resolve_filter(filter: &FilterExpr) -> ResolvedFilter {
+    match filter {
+        FilterExpr::And(a, b) => {
+            ResolvedFilter::And(Box::new(resolve_filter(a)), Box::new(resolve_filter(b)))
+        }
+        FilterExpr::Or(a, b) => {
+            ResolvedFilter::Or(Box::new(resolve_filter(a)), Box::new(resolve_filter(b)))
+        }
+        FilterExpr::Not(inner) => ResolvedFilter::Not(Box::new(resolve_filter(inner))),
+        FilterExpr::Ip(ip) => ResolvedFilter::Ip(resolve_ip_filter(ip)),
+        FilterExpr::Port(port) => ResolvedFilter::Port(resolve_port_filter(port)),
+        FilterExpr::Proto(proto) => ResolvedFilter::Proto(resolve_proto_filter(proto)),
+        FilterExpr::Numeric(num) => ResolvedFilter::Numeric(resolve_numeric_filter(num)),
+        FilterExpr::StringFilter(sf) => ResolvedFilter::StringFilter(resolve_string_filter(sf)),
+        FilterExpr::Field(ff) => ResolvedFilter::Field(resolve_field_filter(ff)),
+    }
+}
+
+fn resolve_ip_filter(ip: &IpFilter) -> ResolvedIpFilter {
+    let value = match &ip.value {
+        IpValue::Addr(addr) => {
+            let v = addr
+                .parse::<std::net::Ipv4Addr>()
+                .map(u32::from)
+                .unwrap_or(0);
+            ResolvedIpValue::Addr(v)
+        }
+        IpValue::Cidr(cidr) => {
+            let parts: Vec<&str> = cidr.split('/').collect();
+            if parts.len() == 2 {
+                let base: u32 = parts[0]
+                    .parse::<std::net::Ipv4Addr>()
+                    .map(u32::from)
+                    .unwrap_or(0);
+                let prefix_len: u32 = parts[1].parse().unwrap_or(0);
+                let mask = if prefix_len == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix_len.min(32))
+                };
+                ResolvedIpValue::Cidr {
+                    base_masked: base & mask,
+                    mask,
+                }
+            } else {
+                ResolvedIpValue::Addr(0)
+            }
+        }
+        IpValue::List(addrs) => {
+            let resolved: Vec<u32> = addrs
+                .iter()
+                .filter_map(|a| a.parse::<std::net::Ipv4Addr>().ok().map(u32::from))
+                .collect();
+            ResolvedIpValue::List(resolved)
+        }
+        IpValue::Wildcard(pattern) => {
+            let octets: Vec<&str> = pattern.split('.').collect();
+            let mut wo = [None; 4];
+            for (i, oct) in octets.iter().enumerate().take(4) {
+                if *oct != "*" {
+                    wo[i] = oct.parse::<u8>().ok();
+                }
+            }
+            ResolvedIpValue::Wildcard(WildcardOctets(wo))
+        }
+    };
+    ResolvedIpFilter {
+        direction: ip.direction,
+        negated: ip.negated,
+        value,
+    }
+}
+
+fn resolve_port_value(pv: &PortValue) -> ResolvedPortValue {
+    match pv {
+        PortValue::Single(p) => ResolvedPortValue::Single(*p),
+        PortValue::Range(lo, hi) => ResolvedPortValue::Range(*lo, *hi),
+        PortValue::List(items) => {
+            ResolvedPortValue::List(items.iter().map(resolve_port_value).collect())
+        }
+        PortValue::Named(name) => ResolvedPortValue::Single(resolve_named_port(name).unwrap_or(0)),
+        PortValue::OpenRange(lo) => ResolvedPortValue::OpenRange(*lo),
+    }
+}
+
+fn resolve_port_filter(port: &PortFilter) -> ResolvedPortFilter {
+    ResolvedPortFilter {
+        direction: port.direction,
+        negated: port.negated,
+        value: resolve_port_value(&port.value),
+    }
+}
+
+fn resolve_proto_value(pv: &ProtoValue) -> ResolvedProtoValue {
+    match pv {
+        ProtoValue::Named(name) => ResolvedProtoValue::Single(resolve_proto(name).unwrap_or(0)),
+        ProtoValue::Number(n) => ResolvedProtoValue::Single(*n),
+        ProtoValue::List(items) => {
+            let resolved: Vec<u8> = items
+                .iter()
+                .map(|item| match item {
+                    ProtoValue::Named(name) => resolve_proto(name).unwrap_or(0),
+                    ProtoValue::Number(n) => *n,
+                    ProtoValue::List(_) => 0,
+                })
+                .collect();
+            ResolvedProtoValue::List(resolved)
+        }
+    }
+}
+
+fn resolve_proto_filter(proto: &ProtoFilter) -> ResolvedProtoFilter {
+    ResolvedProtoFilter {
+        negated: proto.negated,
+        value: resolve_proto_value(&proto.value),
+    }
+}
+
+fn resolve_numeric_target(value: &NumericValue) -> u64 {
+    match value {
+        NumericValue::Integer(n) => *n,
+        NumericValue::WithSuffix(n, suffix) => {
+            let multiplier = match suffix.to_lowercase().as_str() {
+                "k" => 1_000u64,
+                "m" => 1_000_000,
+                "g" => 1_000_000_000,
+                "t" => 1_000_000_000_000,
+                _ => 1,
+            };
+            n * multiplier
+        }
+    }
+}
+
+fn resolve_numeric_filter(num: &NumericFilter) -> ResolvedNumericFilter {
+    ResolvedNumericFilter {
+        col_name: resolve_field_name(&num.field).to_string(),
+        op: num.op,
+        target: resolve_numeric_target(&num.value),
+    }
+}
+
+fn resolve_string_filter(sf: &StringFilterExpr) -> ResolvedStringFilter {
+    let list_items = if matches!(sf.op, StringOp::In | StringOp::NotIn) {
+        sf.value.split(',').map(|s| s.trim().to_string()).collect()
+    } else {
+        Vec::new()
+    };
+    ResolvedStringFilter {
+        col_name: resolve_field_name(&sf.field).to_string(),
+        op: sf.op,
+        value: sf.value.clone(),
+        list_items,
+    }
+}
+
+fn resolve_field_filter(ff: &FieldFilter) -> ResolvedFieldFilter {
+    let target = match &ff.value {
+        AstFieldValue::Integer(n) => *n,
+        AstFieldValue::String(_) | AstFieldValue::List(_) => 0,
+    };
+    ResolvedFieldFilter {
+        col_name: resolve_field_name(&ff.field).to_string(),
+        op: ff.op,
+        target,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -119,16 +420,44 @@ pub struct QueryResult {
 /// Resolve short aliases to canonical IPFIX field names.
 fn resolve_field_name(name: &str) -> &str {
     match name {
+        // Core 5-tuple
         "src" => "sourceIPv4Address",
         "dst" => "destinationIPv4Address",
         "sport" => "sourceTransportPort",
         "dport" => "destinationTransportPort",
         "proto" => "protocolIdentifier",
+        "port" => "sourceTransportPort", // any-direction handled at filter level
+        // Counters
         "bytes" => "octetDeltaCount",
         "packets" => "packetDeltaCount",
-        "tos" => "ipClassOfService",
+        // QoS / classification
+        "tos" | "dscp" => "ipClassOfService",
+        "flags" | "tcpflags" => "tcpControlBits",
+        // Routing
         "nexthop" => "ipNextHopIPv4Address",
+        "nexthop6" => "ipNextHopIPv6Address",
+        "bgp_nexthop" => "bgpNextHopIPv4Address",
+        "src_as" | "srcas" => "bgpSourceAsNumber",
+        "dst_as" | "dstas" => "bgpDestinationAsNumber",
+        // L2
         "vlan" => "vlanId",
+        "src_mac" | "srcmac" => "sourceMacAddress",
+        "dst_mac" | "dstmac" => "destinationMacAddress",
+        // Interfaces
+        "in_if" | "ingress" => "ingressInterface",
+        "out_if" | "egress" => "egressInterface",
+        // Timing
+        "duration" => "flowDurationMilliseconds",
+        "start" => "flowStartMilliseconds",
+        "end" => "flowEndMilliseconds",
+        // ICMP
+        "icmp_type" => "icmpTypeCodeIPv4",
+        "icmp6_type" => "icmpTypeCodeIPv6",
+        // Exporter
+        "exporter" => "flowcusExporterIPv4",
+        "domain_id" => "flowcusObservationDomainId",
+        // Application
+        "app" => "applicationName",
         other => other,
     }
 }
@@ -193,7 +522,7 @@ fn now_unix() -> u32 {
 }
 
 /// Convert a `TimeRange` to (start_unix_secs, end_unix_secs).
-fn time_range_to_bounds(tr: &TimeRange) -> (u32, u32) {
+pub fn time_range_to_bounds(tr: &TimeRange) -> (u32, u32) {
     let now = now_unix();
     match tr {
         TimeRange::Relative { duration, offset } => {
@@ -356,6 +685,17 @@ fn collect_referenced_columns(query: &Query) -> Vec<String> {
     cols
 }
 
+/// Collect column names referenced by filter expressions.
+fn collect_filter_column_names(filters: &[&FilterExpr]) -> Vec<String> {
+    let mut cols = Vec::new();
+    for f in filters {
+        collect_filter_columns(f, &mut cols);
+    }
+    cols.sort();
+    cols.dedup();
+    cols
+}
+
 fn collect_filter_columns(f: &FilterExpr, out: &mut Vec<String>) {
     match f {
         FilterExpr::And(a, b) | FilterExpr::Or(a, b) => {
@@ -502,33 +842,37 @@ fn column_to_json(buf: &ColumnBuffer, row: usize, col_name: &str) -> serde_json:
 }
 
 // ---------------------------------------------------------------------------
-// Filter evaluation
+// Fast filter evaluation using pre-resolved filters
 // ---------------------------------------------------------------------------
 
-/// Evaluate a filter expression against a row from decoded column buffers.
-fn evaluate_filter(
-    filter: &FilterExpr,
+/// Evaluate a pre-resolved filter against a row from decoded column buffers.
+fn evaluate_resolved_filter(
+    filter: &ResolvedFilter,
     row: usize,
     columns: &HashMap<String, ColumnBuffer>,
 ) -> bool {
     match filter {
-        FilterExpr::And(a, b) => {
-            evaluate_filter(a, row, columns) && evaluate_filter(b, row, columns)
+        ResolvedFilter::And(a, b) => {
+            evaluate_resolved_filter(a, row, columns) && evaluate_resolved_filter(b, row, columns)
         }
-        FilterExpr::Or(a, b) => {
-            evaluate_filter(a, row, columns) || evaluate_filter(b, row, columns)
+        ResolvedFilter::Or(a, b) => {
+            evaluate_resolved_filter(a, row, columns) || evaluate_resolved_filter(b, row, columns)
         }
-        FilterExpr::Not(inner) => !evaluate_filter(inner, row, columns),
-        FilterExpr::Ip(ip) => evaluate_ip_filter(ip, row, columns),
-        FilterExpr::Port(port) => evaluate_port_filter(port, row, columns),
-        FilterExpr::Proto(proto) => evaluate_proto_filter(proto, row, columns),
-        FilterExpr::Numeric(num) => evaluate_numeric_filter(num, row, columns),
-        FilterExpr::StringFilter(sf) => evaluate_string_filter(sf, row, columns),
-        FilterExpr::Field(ff) => evaluate_field_filter(ff, row, columns),
+        ResolvedFilter::Not(inner) => !evaluate_resolved_filter(inner, row, columns),
+        ResolvedFilter::Ip(ip) => eval_resolved_ip(ip, row, columns),
+        ResolvedFilter::Port(port) => eval_resolved_port(port, row, columns),
+        ResolvedFilter::Proto(proto) => eval_resolved_proto(proto, row, columns),
+        ResolvedFilter::Numeric(num) => eval_resolved_numeric(num, row, columns),
+        ResolvedFilter::StringFilter(sf) => eval_resolved_string(sf, row, columns),
+        ResolvedFilter::Field(ff) => eval_resolved_field(ff, row, columns),
     }
 }
 
-fn evaluate_ip_filter(ip: &IpFilter, row: usize, columns: &HashMap<String, ColumnBuffer>) -> bool {
+fn eval_resolved_ip(
+    ip: &ResolvedIpFilter,
+    row: usize,
+    columns: &HashMap<String, ColumnBuffer>,
+) -> bool {
     let check = |col_name: &str| -> bool {
         let buf = match columns.get(col_name) {
             Some(b) => b,
@@ -536,17 +880,15 @@ fn evaluate_ip_filter(ip: &IpFilter, row: usize, columns: &HashMap<String, Colum
         };
         let val = column_get_u32(buf, row);
         let matched = match &ip.value {
-            IpValue::Addr(addr) => addr
-                .parse::<std::net::Ipv4Addr>()
-                .map(|a| u32::from(a) == val)
-                .unwrap_or(false),
-            IpValue::Cidr(cidr) => match_cidr(val, cidr),
-            IpValue::List(addrs) => addrs.iter().any(|a| {
-                a.parse::<std::net::Ipv4Addr>()
-                    .map(|parsed| u32::from(parsed) == val)
-                    .unwrap_or(false)
-            }),
-            IpValue::Wildcard(pattern) => match_ip_wildcard(val, pattern),
+            ResolvedIpValue::Addr(addr) => val == *addr,
+            ResolvedIpValue::Cidr { base_masked, mask } => (val & *mask) == *base_masked,
+            ResolvedIpValue::List(addrs) => addrs.contains(&val),
+            ResolvedIpValue::Wildcard(wo) => {
+                let octets = val.to_be_bytes();
+                wo.0.iter()
+                    .enumerate()
+                    .all(|(i, expected)| expected.is_none() || *expected == Some(octets[i]))
+            }
         };
         if ip.negated { !matched } else { matched }
     };
@@ -558,50 +900,17 @@ fn evaluate_ip_filter(ip: &IpFilter, row: usize, columns: &HashMap<String, Colum
     }
 }
 
-fn match_cidr(val: u32, cidr: &str) -> bool {
-    let parts: Vec<&str> = cidr.split('/').collect();
-    if parts.len() != 2 {
-        return false;
+fn match_resolved_port(val: u16, pv: &ResolvedPortValue) -> bool {
+    match pv {
+        ResolvedPortValue::Single(p) => val == *p,
+        ResolvedPortValue::Range(lo, hi) => val >= *lo && val <= *hi,
+        ResolvedPortValue::List(items) => items.iter().any(|item| match_resolved_port(val, item)),
+        ResolvedPortValue::OpenRange(lo) => val >= *lo,
     }
-    let base: u32 = match parts[0].parse::<std::net::Ipv4Addr>() {
-        Ok(a) => u32::from(a),
-        Err(_) => return false,
-    };
-    let prefix_len: u32 = match parts[1].parse() {
-        Ok(p) if p <= 32 => p,
-        _ => return false,
-    };
-    if prefix_len == 0 {
-        return true;
-    }
-    let mask = u32::MAX << (32 - prefix_len);
-    (val & mask) == (base & mask)
 }
 
-fn match_ip_wildcard(val: u32, pattern: &str) -> bool {
-    let ip = std::net::Ipv4Addr::from(val);
-    let octets: Vec<&str> = pattern.split('.').collect();
-    let ip_octets = ip.octets();
-    if octets.len() != 4 {
-        return false;
-    }
-    for (i, oct) in octets.iter().enumerate() {
-        if *oct == "*" {
-            continue;
-        }
-        if let Ok(v) = oct.parse::<u8>() {
-            if ip_octets[i] != v {
-                return false;
-            }
-        } else {
-            return false;
-        }
-    }
-    true
-}
-
-fn evaluate_port_filter(
-    port: &PortFilter,
+fn eval_resolved_port(
+    port: &ResolvedPortFilter,
     row: usize,
     columns: &HashMap<String, ColumnBuffer>,
 ) -> bool {
@@ -611,7 +920,7 @@ fn evaluate_port_filter(
             None => return false,
         };
         let val = column_get_u16(buf, row);
-        let matched = match_port_value(val, &port.value);
+        let matched = match_resolved_port(val, &port.value);
         if port.negated { !matched } else { matched }
     };
 
@@ -622,18 +931,8 @@ fn evaluate_port_filter(
     }
 }
 
-fn match_port_value(val: u16, pv: &PortValue) -> bool {
-    match pv {
-        PortValue::Single(p) => val == *p,
-        PortValue::Range(lo, hi) => val >= *lo && val <= *hi,
-        PortValue::List(items) => items.iter().any(|item| match_port_value(val, item)),
-        PortValue::Named(name) => resolve_named_port(name).map(|p| val == p).unwrap_or(false),
-        PortValue::OpenRange(lo) => val >= *lo,
-    }
-}
-
-fn evaluate_proto_filter(
-    proto: &ProtoFilter,
+fn eval_resolved_proto(
+    proto: &ResolvedProtoFilter,
     row: usize,
     columns: &HashMap<String, ColumnBuffer>,
 ) -> bool {
@@ -642,60 +941,39 @@ fn evaluate_proto_filter(
         None => return false,
     };
     let val = column_get_u8(buf, row);
-    let matched = match_proto_value(val, &proto.value);
+    let matched = match &proto.value {
+        ResolvedProtoValue::Single(n) => val == *n,
+        ResolvedProtoValue::List(items) => items.contains(&val),
+    };
     if proto.negated { !matched } else { matched }
 }
 
-fn match_proto_value(val: u8, pv: &ProtoValue) -> bool {
-    match pv {
-        ProtoValue::Named(name) => resolve_proto(name).map(|p| val == p).unwrap_or(false),
-        ProtoValue::Number(n) => val == *n,
-        ProtoValue::List(items) => items.iter().any(|item| match_proto_value(val, item)),
-    }
-}
-
-fn evaluate_numeric_filter(
-    num: &NumericFilter,
+fn eval_resolved_numeric(
+    num: &ResolvedNumericFilter,
     row: usize,
     columns: &HashMap<String, ColumnBuffer>,
 ) -> bool {
-    let col_name = resolve_field_name(&num.field);
-    let buf = match columns.get(col_name) {
+    let buf = match columns.get(&num.col_name) {
         Some(b) => b,
         None => return false,
     };
     let val = column_get_u64(buf, row);
-    let target = match &num.value {
-        NumericValue::Integer(n) => *n,
-        NumericValue::WithSuffix(n, suffix) => {
-            let multiplier = match suffix.to_lowercase().as_str() {
-                "k" => 1_000,
-                "m" => 1_000_000,
-                "g" => 1_000_000_000,
-                "t" => 1_000_000_000_000,
-                _ => 1,
-            };
-            n * multiplier
-        }
-    };
-
     match num.op {
-        CompareOp::Eq => val == target,
-        CompareOp::Ne => val != target,
-        CompareOp::Gt => val > target,
-        CompareOp::Ge => val >= target,
-        CompareOp::Lt => val < target,
-        CompareOp::Le => val <= target,
+        CompareOp::Eq => val == num.target,
+        CompareOp::Ne => val != num.target,
+        CompareOp::Gt => val > num.target,
+        CompareOp::Ge => val >= num.target,
+        CompareOp::Lt => val < num.target,
+        CompareOp::Le => val <= num.target,
     }
 }
 
-fn evaluate_string_filter(
-    sf: &StringFilterExpr,
+fn eval_resolved_string(
+    sf: &ResolvedStringFilter,
     row: usize,
     columns: &HashMap<String, ColumnBuffer>,
 ) -> bool {
-    let col_name = resolve_field_name(&sf.field);
-    let buf = match columns.get(col_name) {
+    let buf = match columns.get(&sf.col_name) {
         Some(b) => b,
         None => return false,
     };
@@ -703,10 +981,9 @@ fn evaluate_string_filter(
     let val = String::from_utf8_lossy(val_bytes);
 
     match sf.op {
-        StringOp::Eq => val == sf.value,
-        StringOp::Ne => val != sf.value,
+        StringOp::Eq => val == sf.value.as_str(),
+        StringOp::Ne => val != sf.value.as_str(),
         StringOp::Regex | StringOp::NotRegex => {
-            // Simple substring/glob match without regex dependency
             let matched = val.contains(&sf.value);
             if sf.op == StringOp::NotRegex {
                 !matched
@@ -715,8 +992,10 @@ fn evaluate_string_filter(
             }
         }
         StringOp::In | StringOp::NotIn => {
-            let items: Vec<&str> = sf.value.split(',').map(|s| s.trim()).collect();
-            let matched = items.iter().any(|item| val.as_ref() == *item);
+            let matched = sf
+                .list_items
+                .iter()
+                .any(|item| val.as_ref() == item.as_str());
             if sf.op == StringOp::NotIn {
                 !matched
             } else {
@@ -726,32 +1005,34 @@ fn evaluate_string_filter(
     }
 }
 
-fn evaluate_field_filter(
-    ff: &FieldFilter,
+fn eval_resolved_field(
+    ff: &ResolvedFieldFilter,
     row: usize,
     columns: &HashMap<String, ColumnBuffer>,
 ) -> bool {
-    let col_name = resolve_field_name(&ff.field);
-    let buf = match columns.get(col_name) {
+    let buf = match columns.get(&ff.col_name) {
         Some(b) => b,
         None => return false,
     };
     let val = column_get_u64(buf, row);
-    let target = match &ff.value {
-        AstFieldValue::Integer(n) => *n,
-        AstFieldValue::String(_) => return false, // can't compare string to numeric
-        AstFieldValue::List(_) => return false,
-    };
-
     match ff.op {
-        CompareOp::Eq => val == target,
-        CompareOp::Ne => val != target,
-        CompareOp::Gt => val > target,
-        CompareOp::Ge => val >= target,
-        CompareOp::Lt => val < target,
-        CompareOp::Le => val <= target,
+        CompareOp::Eq => val == ff.target,
+        CompareOp::Ne => val != ff.target,
+        CompareOp::Gt => val > ff.target,
+        CompareOp::Ge => val >= ff.target,
+        CompareOp::Lt => val < ff.target,
+        CompareOp::Le => val <= ff.target,
     }
 }
+
+// ---------------------------------------------------------------------------
+// Legacy filter evaluation (needed for index_may_match which uses AST filters)
+// ---------------------------------------------------------------------------
+
+// Legacy per-row filter evaluation functions removed — the hot path now uses
+// `ResolvedFilter` + `evaluate_resolved_filter` which pre-resolves all
+// constants before the row loop. The `index_may_match` function still uses
+// AST `FilterExpr` types directly for min/max pruning (no per-row eval).
 
 // ---------------------------------------------------------------------------
 // Column index min/max checking
@@ -771,9 +1052,10 @@ fn index_may_match(
             let relevant = match ip.direction {
                 IpDirection::Src => col_name == "sourceIPv4Address",
                 IpDirection::Dst => col_name == "destinationIPv4Address",
-                IpDirection::Any => {
-                    col_name == "sourceIPv4Address" || col_name == "destinationIPv4Address"
-                }
+                // For `Any` direction (src OR dst), a single column's mark
+                // cannot exclude the granule — the value may be in the other
+                // column. Always return true (may match) for Any.
+                IpDirection::Any => return true,
             };
             if !relevant {
                 return true; // not this column
@@ -831,9 +1113,9 @@ fn index_may_match(
             let relevant = match port.direction {
                 PortDirection::Src => col_name == "sourceTransportPort",
                 PortDirection::Dst => col_name == "destinationTransportPort",
-                PortDirection::Any => {
-                    col_name == "sourceTransportPort" || col_name == "destinationTransportPort"
-                }
+                // Same as IP: `port` (Any) = OR semantics, cannot prune by
+                // a single column's mark range.
+                PortDirection::Any => return true,
             };
             if !relevant {
                 return true;
@@ -868,19 +1150,7 @@ fn index_may_match(
             if col_name != resolved {
                 return true;
             }
-            let target = match &num.value {
-                NumericValue::Integer(n) => *n,
-                NumericValue::WithSuffix(n, suffix) => {
-                    let multiplier = match suffix.to_lowercase().as_str() {
-                        "k" => 1_000u64,
-                        "m" => 1_000_000,
-                        "g" => 1_000_000_000,
-                        "t" => 1_000_000_000_000,
-                        _ => 1,
-                    };
-                    n * multiplier
-                }
-            };
+            let target = resolve_numeric_target(&num.value);
             let (col_min, col_max) = match storage_type {
                 StorageType::U32 => (
                     u32::from_le_bytes(min_val[..4].try_into().unwrap()) as u64,
@@ -915,7 +1185,7 @@ fn index_may_match(
 // ---------------------------------------------------------------------------
 
 /// Extract bytes for bloom filter lookup from a filter expression.
-fn bloom_lookup_bytes(filter: &FilterExpr) -> Vec<(String, Vec<u8>)> {
+pub fn bloom_lookup_bytes(filter: &FilterExpr) -> Vec<(String, Vec<u8>)> {
     let mut result = Vec::new();
     match filter {
         FilterExpr::Ip(ip) if !ip.negated => {
@@ -929,10 +1199,11 @@ fn bloom_lookup_bytes(filter: &FilterExpr) -> Vec<(String, Vec<u8>)> {
                         IpDirection::Dst => {
                             result.push(("destinationIPv4Address".to_string(), bytes));
                         }
-                        IpDirection::Any => {
-                            result.push(("sourceIPv4Address".to_string(), bytes.clone()));
-                            result.push(("destinationIPv4Address".to_string(), bytes));
-                        }
+                        // `ip` (Any) means src OR dst — cannot use bloom AND
+                        // semantics. A granule that has the value in src but
+                        // not in dst would be incorrectly skipped. Skip bloom
+                        // for `Any` direction; row-level filter handles it.
+                        IpDirection::Any => {}
                     }
                 }
             }
@@ -947,10 +1218,8 @@ fn bloom_lookup_bytes(filter: &FilterExpr) -> Vec<(String, Vec<u8>)> {
                     PortDirection::Dst => {
                         result.push(("destinationTransportPort".to_string(), bytes));
                     }
-                    PortDirection::Any => {
-                        result.push(("sourceTransportPort".to_string(), bytes.clone()));
-                        result.push(("destinationTransportPort".to_string(), bytes));
-                    }
+                    // Same as IP: `port` (Any) = src OR dst, bloom is AND.
+                    PortDirection::Any => {}
                 }
             }
         }
@@ -1026,7 +1295,6 @@ impl AggAccumulator {
             AggFunc::First => self.first.map_or(serde_json::Value::Null, json_f64),
             AggFunc::Last => self.last.map_or(serde_json::Value::Null, json_f64),
             AggFunc::Rate => {
-                // rate = sum / count (simplified)
                 if self.count > 0 {
                     json_f64(self.sum / self.count as f64)
                 } else {
@@ -1059,46 +1327,21 @@ fn json_f64(v: f64) -> serde_json::Value {
 /// as subsumed and removes it from the list, recording skip steps in the
 /// execution plan.
 fn deduplicate_parts(parts: &mut Vec<PartEntry>, plan: &mut ExecutionPlan) {
-    let len = parts.len();
-    let mut to_remove = vec![false; len];
-    let mut subsumed_by: Vec<Option<usize>> = vec![None; len];
-
-    for i in 0..len {
-        if to_remove[i] {
-            continue;
-        }
-        for j in 0..len {
-            if i == j || to_remove[j] {
-                continue;
-            }
-            if parts[j].generation > parts[i].generation
-                && parts[j].time_min <= parts[i].time_min
-                && parts[j].time_max >= parts[i].time_max
-            {
-                to_remove[i] = true;
-                subsumed_by[i] = Some(j);
-                break;
-            }
-        }
-    }
-
-    // Record plan steps before removing
-    for i in 0..len {
-        if to_remove[i] {
-            let by_idx = subsumed_by[i].unwrap_or(0);
-            plan.steps.push(PlanStep::PartSkippedSubsumed {
-                path: parts[i].path.display().to_string(),
-                subsumed_by: parts[by_idx].path.display().to_string(),
-            });
-        }
-    }
-
-    let mut idx = 0;
-    parts.retain(|_| {
-        let keep = !to_remove[idx];
-        idx += 1;
-        keep
-    });
+    // Generation-based dedup is intentionally disabled.
+    //
+    // The merge process already handles concurrency correctly:
+    // 1. The merged output part carries a `.merging` marker until all source
+    //    parts are deleted.
+    // 2. The executor skips parts with `.merging` markers (see process_part).
+    // 3. After merge commits, source parts are deleted — no duplicates remain.
+    //
+    // Time-range-based dedup was previously used here but caused data loss:
+    // during the current hour, the merge coordinator merges same-generation
+    // parts in small batches (chunks of 4). This creates parts at different
+    // generations that share the same time range but contain DISJOINT data.
+    // Skipping lower-gen parts based on time containment by higher-gen parts
+    // silently dropped rows that were never merged into the higher-gen part.
+    let _ = (parts, plan);
 }
 
 // ---------------------------------------------------------------------------
@@ -1111,11 +1354,36 @@ impl QueryExecutor {
         Self {
             table_base: storage_dir.join("flows"),
             granule_size,
+            cache: Arc::new(StorageCache::default()),
+        }
+    }
+
+    pub fn with_cache(storage_dir: &Path, granule_size: usize, cache: Arc<StorageCache>) -> Self {
+        Self {
+            table_base: storage_dir.join("flows"),
+            granule_size,
+            cache,
         }
     }
 
     /// Execute a parsed query and return results with the execution plan.
-    pub fn execute(&self, query: &Query) -> std::io::Result<QueryResult> {
+    ///
+    /// `offset` and `limit` control pagination at the executor level.
+    /// `pinned_time`: if `Some((start, end))`, use these absolute bounds
+    /// instead of resolving the query's time range from `now()`. This
+    /// prevents the time window from shifting during infinite scroll.
+    ///
+    /// For non-aggregate queries, the executor processes parts in reverse time
+    /// order and stops once `offset + limit` matching rows are collected.
+    /// For aggregate queries, all matching rows must be processed.
+    pub fn execute(
+        &self,
+        query: &Query,
+        offset: u64,
+        limit: u64,
+        pinned_time: Option<(u32, u32)>,
+    ) -> std::io::Result<QueryResult> {
+        let _execute_timer = span_timer("query;execute");
         let mut plan = ExecutionPlan {
             steps: Vec::new(),
             parts_total: 0,
@@ -1125,10 +1393,13 @@ impl QueryExecutor {
             granules_skipped_by_bloom: 0,
             granules_skipped_by_marks: 0,
             columns_to_read: Vec::new(),
+            bytes_read: 0,
         };
 
-        // Step 1: Convert time range to unix bounds
-        let (time_start, time_end) = time_range_to_bounds(&query.time_range);
+        // Step 1: Convert time range to unix bounds (or use pinned bounds)
+        let time_prune_start = Instant::now();
+        let (time_start, time_end) =
+            pinned_time.unwrap_or_else(|| time_range_to_bounds(&query.time_range));
         debug!(time_start, time_end, "Query time range");
 
         // Step 2: Discover parts
@@ -1137,6 +1408,7 @@ impl QueryExecutor {
         let parts_total = all_parts.len();
         let filtered_parts = table.list_parts(Some(time_start), Some(time_end))?;
         let parts_after_time = filtered_parts.len();
+        let time_prune_us = u64::try_from(time_prune_start.elapsed().as_micros()).ok();
 
         plan.parts_total = parts_total;
         plan.parts_skipped_by_time = parts_total.saturating_sub(parts_after_time);
@@ -1145,18 +1417,21 @@ impl QueryExecutor {
             end: time_end,
             parts_before: parts_total,
             parts_after: parts_after_time,
+            duration_us: time_prune_us,
         });
 
         // Step 3: Determine columns to read
         let referenced_cols = collect_referenced_columns(query);
-        let needs_all_columns = query
-            .stages
-            .iter()
-            .any(|s| matches!(s, Stage::Select(SelectExpr::All | SelectExpr::AllExcept(_))));
+        let has_select_stage = query.stages.iter().any(|s| matches!(s, Stage::Select(_)));
+        let needs_all_columns = !has_select_stage
+            || query
+                .stages
+                .iter()
+                .any(|s| matches!(s, Stage::Select(SelectExpr::All | SelectExpr::AllExcept(_))));
         plan.columns_to_read = referenced_cols.clone();
 
-        // Step 4: Extract filters
-        let filters: Vec<&FilterExpr> = query
+        // Step 4: Extract filters and pre-resolve constants
+        let ast_filters: Vec<&FilterExpr> = query
             .stages
             .iter()
             .filter_map(|s| {
@@ -1168,79 +1443,30 @@ impl QueryExecutor {
             })
             .collect();
 
+        let resolved_filters: Vec<ResolvedFilter> =
+            ast_filters.iter().map(|f| resolve_filter(f)).collect();
+
         // Step 5: Deduplicate parts (skip lower-gen parts subsumed by higher-gen)
         let mut filtered_parts = filtered_parts;
         deduplicate_parts(&mut filtered_parts, &mut plan);
 
-        // Step 6: Process parts
-        let mut all_rows: Vec<HashMap<String, serde_json::Value>> = Vec::new();
-        let mut total_rows_scanned: u64 = 0;
-        let mut parts_skipped_by_index: usize = 0;
-        let mut parts_skipped_by_merge: usize = 0;
-
-        for part_entry in &filtered_parts {
-            // Skip parts with .merging marker (merge output being staged)
-            if part_entry.path.join(".merging").exists() {
-                parts_skipped_by_merge += 1;
-                plan.steps.push(PlanStep::PartSkippedMerging {
-                    path: part_entry.path.display().to_string(),
-                });
-                continue;
-            }
-            let part_result = self.process_part(
-                part_entry,
-                &filters,
-                &referenced_cols,
-                needs_all_columns,
-                &mut plan,
-            );
-
-            match part_result {
-                Ok(ProcessPartResult::Skipped) => {
-                    parts_skipped_by_index += 1;
+        // Compute total rows in range from part metadata (no column reads).
+        let total_rows_in_range: u64 = {
+            let mut sum = 0u64;
+            for pe in &filtered_parts {
+                if pe.path.join(".merging").exists() {
+                    continue;
                 }
-                Ok(ProcessPartResult::Rows { rows, rows_scanned }) => {
-                    total_rows_scanned += rows_scanned;
-                    all_rows.extend(rows);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Check if a higher-gen part subsumes this one (data is safe)
-                    let subsumed = filtered_parts.iter().any(|other| {
-                        other.generation > part_entry.generation
-                            && other.time_min <= part_entry.time_min
-                            && other.time_max >= part_entry.time_max
-                    });
-                    if subsumed {
-                        debug!(
-                            error = %e,
-                            part = %part_entry.path.display(),
-                            "Part not found but subsumed by higher-gen part, skipping"
-                        );
-                    } else {
-                        tracing::warn!(
-                            error = %e,
-                            part = %part_entry.path.display(),
-                            "Part not found and no higher-gen part covers it — data may be temporarily unavailable during merge"
-                        );
-                    }
-                    parts_skipped_by_merge += 1;
-                    plan.steps.push(PlanStep::PartSkippedMerge {
-                        path: part_entry.path.display().to_string(),
-                    });
-                }
-                Err(e) => {
-                    debug!(error = %e, part = %part_entry.path.display(), "Error processing part, skipping");
+                let meta_path = pe.path.join("meta.bin");
+                if let Ok((meta, _)) = self.cache.get_meta(&meta_path) {
+                    sum += meta.row_count;
                 }
             }
-        }
+            sum
+        };
 
-        plan.parts_skipped_by_index = parts_skipped_by_index;
-
-        // Step 6: Determine output columns
-        let output_columns = self.determine_output_columns(query, &all_rows);
-
-        // Step 7: Check if query has an aggregate stage or explicit limit
-        let has_aggregate = query.stages.iter().any(|s| {
+        // Step 6: Determine if this is an aggregate query
+        let is_aggregate = query.stages.iter().any(|s| {
             matches!(
                 s,
                 Stage::Aggregate(AggExpr::GroupBy { .. })
@@ -1253,32 +1479,331 @@ impl QueryExecutor {
             .iter()
             .any(|s| matches!(s, Stage::Aggregate(AggExpr::Limit(_))));
 
-        // Step 7b: Apply default sort + limit for raw (non-aggregate) queries
-        if !has_aggregate && !has_explicit_limit {
-            // Find flowcusExportTime column index to sort by time descending
-            let time_col = "flowcusExportTime";
-            let has_time_col = all_rows
-                .first()
-                .map(|r| r.contains_key(time_col))
-                .unwrap_or(false);
-            if has_time_col {
-                all_rows.sort_by(|a, b| {
-                    let va = a.get(time_col).and_then(|v| v.as_u64()).unwrap_or(0);
-                    let vb = b.get(time_col).and_then(|v| v.as_u64()).unwrap_or(0);
-                    vb.cmp(&va) // descending
-                });
+        // For non-aggregate queries, sort parts in reverse time order (newest first)
+        // so we can early-terminate once we have enough rows.
+        if !is_aggregate {
+            filtered_parts.sort_by(|a, b| {
+                b.time_max
+                    .cmp(&a.time_max)
+                    .then(b.time_min.cmp(&a.time_min))
+            });
+        }
+
+        // ================================================================
+        // FAST PATH: Stats-based aggregation shortcut
+        // ================================================================
+        // For unfiltered aggregation queries (no filter stages), answer
+        // directly from .stats files without reading any column data.
+        // Supports: group by <time_bucket> | sum/count/min/max(field),
+        //           top N / sort by sum/count/min/max(field)
+        if ast_filters.is_empty() {
+            let stats_start = Instant::now();
+            if let Some(result) = self.try_stats_shortcut(
+                query,
+                &filtered_parts,
+                &mut plan,
+                time_start,
+                time_end,
+                parts_after_time,
+                total_rows_in_range,
+                stats_start,
+            ) {
+                return result;
             }
         }
 
-        // Step 8: Apply aggregation if present
-        let (result_columns, result_rows) =
-            self.apply_aggregation(query, &output_columns, &all_rows);
+        // Determine the needed row count for early termination.
+        // For non-aggregate queries: we need offset + limit rows.
+        // For aggregate queries: we need all rows.
+        let needed_rows = if is_aggregate {
+            u64::MAX
+        } else {
+            offset.saturating_add(limit)
+        };
+
+        // Determine which output columns we need
+        let filter_col_names = collect_filter_column_names(&ast_filters);
+
+        // Step 7: Process parts with columnar filtering
+        let mut all_rows: Vec<Vec<serde_json::Value>> = Vec::new();
+        let mut total_rows_scanned: u64 = 0;
+        let mut total_matching_rows: u64 = 0;
+        let mut parts_skipped_by_index: usize = 0;
+        let mut parts_skipped_by_merge: usize = 0;
+        // Collect all column names from schemas for select-all mode
+        let mut all_schema_columns: Vec<String> = Vec::new();
+        // For aggregate queries, we accumulate column buffers + matching indices
+        // instead of building JSON rows eagerly
+        let mut agg_matching_indices: Vec<(usize, u32)> = Vec::new(); // (part_idx, row_idx)
+        let mut agg_part_columns: Vec<HashMap<String, ColumnBuffer>> = Vec::new();
+
+        // ================================================================
+        // TopN/Sort fast path: read only the sort field column, use a heap
+        // to find top-N rows, then decode remaining columns only for those.
+        // ================================================================
+        let topn_start = Instant::now();
+        if let Some(result) = self.try_topn_fast_path(
+            query,
+            &filtered_parts,
+            &ast_filters,
+            &resolved_filters,
+            &filter_col_names,
+            &referenced_cols,
+            needs_all_columns,
+            &mut plan,
+            parts_total,
+            parts_after_time,
+            time_start,
+            time_end,
+            total_rows_in_range,
+            topn_start,
+        ) {
+            return result;
+        }
+
+        let _parts_scan_timer = span_timer("query;parts_scan");
+
+        // Helper: process one part, handling errors inline
+        let process_one_part = |part_entry: &PartEntry,
+                                local_plan: &mut ExecutionPlan|
+         -> std::io::Result<ProcessPartResult> {
+            if part_entry.path.join(".merging").exists() {
+                local_plan.steps.push(PlanStep::PartSkippedMerging {
+                    path: part_entry.path.display().to_string(),
+                });
+                return Ok(ProcessPartResult::SkippedMerge);
+            }
+
+            match self.process_part_columnar(
+                part_entry,
+                &ast_filters,
+                &resolved_filters,
+                &referenced_cols,
+                &filter_col_names,
+                needs_all_columns,
+                is_aggregate,
+                local_plan,
+            ) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    let subsumed = filtered_parts.iter().any(|other| {
+                        other.generation > part_entry.generation
+                            && other.time_min <= part_entry.time_min
+                            && other.time_max >= part_entry.time_max
+                    });
+                    if subsumed {
+                        debug!(error = %e, part = %part_entry.path.display(),
+                                "Part not found but subsumed by higher-gen part, skipping");
+                    } else {
+                        tracing::warn!(error = %e, part = %part_entry.path.display(),
+                                "Part not found — data may be temporarily unavailable during merge");
+                    }
+                    local_plan.steps.push(PlanStep::PartSkippedMerge {
+                        path: part_entry.path.display().to_string(),
+                    });
+                    Ok(ProcessPartResult::SkippedMerge)
+                }
+                Err(e) => {
+                    debug!(error = %e, part = %part_entry.path.display(), "Error processing part, skipping");
+                    Ok(ProcessPartResult::SkippedMerge)
+                }
+                ok => ok,
+            }
+        };
+
+        // Macro-like helper to merge a part result into accumulators.
+        // Inlined to avoid borrow checker issues with closures.
+        macro_rules! merge_part_result {
+            ($result:expr, $local_plan:expr) => {
+                plan.steps.extend($local_plan.steps);
+                plan.bytes_read += $local_plan.bytes_read;
+                plan.granules_skipped_by_bloom += $local_plan.granules_skipped_by_bloom;
+                plan.granules_skipped_by_marks += $local_plan.granules_skipped_by_marks;
+                match $result {
+                    ProcessPartResult::Skipped => {
+                        parts_skipped_by_index += 1;
+                    }
+                    ProcessPartResult::SkippedMerge => {
+                        parts_skipped_by_merge += 1;
+                    }
+                    ProcessPartResult::Rows {
+                        rows,
+                        rows_scanned,
+                        output_col_names,
+                    } => {
+                        total_rows_scanned += rows_scanned;
+                        total_matching_rows += rows.len() as u64;
+                        for col in &output_col_names {
+                            if !all_schema_columns.contains(col) {
+                                all_schema_columns.push(col.clone());
+                            }
+                        }
+                        all_rows.extend(rows);
+                    }
+                    ProcessPartResult::ColumnarData {
+                        columns: part_cols,
+                        matching_indices,
+                        rows_scanned,
+                        output_col_names,
+                    } => {
+                        total_rows_scanned += rows_scanned;
+                        total_matching_rows += matching_indices.len() as u64;
+                        for col in &output_col_names {
+                            if !all_schema_columns.contains(col) {
+                                all_schema_columns.push(col.clone());
+                            }
+                        }
+                        let part_idx = agg_part_columns.len();
+                        agg_part_columns.push(part_cols);
+                        for idx in matching_indices {
+                            agg_matching_indices.push((part_idx, idx));
+                        }
+                    }
+                }
+            };
+        }
+
+        if is_aggregate {
+            // ================================================================
+            // Aggregate queries: parallel scan — must process ALL parts.
+            // ================================================================
+            struct ParPartResult {
+                result: ProcessPartResult,
+                local_plan: ExecutionPlan,
+            }
+
+            let parallel_start = Instant::now();
+
+            let par_results: Vec<ParPartResult> = filtered_parts
+                .par_iter()
+                .filter_map(|part_entry| {
+                    let mut local_plan = ExecutionPlan::default();
+                    let result = process_one_part(part_entry, &mut local_plan).ok()?;
+                    Some(ParPartResult { result, local_plan })
+                })
+                .collect();
+
+            let parallel_us = u64::try_from(parallel_start.elapsed().as_micros()).ok();
+            plan.steps.push(PlanStep::ParallelScan {
+                parts_count: filtered_parts.len(),
+                duration_us: parallel_us,
+            });
+
+            for par in par_results {
+                merge_part_result!(par.result, par.local_plan);
+            }
+        } else {
+            // ================================================================
+            // Non-aggregate queries: sequential scan with early exit.
+            // Stops as soon as we have enough rows for offset + limit.
+            // ================================================================
+            let scan_start = Instant::now();
+
+            for part_entry in &filtered_parts {
+                let mut local_plan = ExecutionPlan::default();
+                if let Ok(result) = process_one_part(part_entry, &mut local_plan) {
+                    merge_part_result!(result, local_plan);
+                }
+
+                if all_rows.len() as u64 >= needed_rows {
+                    break;
+                }
+            }
+
+            let scan_us = u64::try_from(scan_start.elapsed().as_micros()).ok();
+            // Still report as a scan step so the Gantt shows it
+            plan.steps.push(PlanStep::ParallelScan {
+                parts_count: filtered_parts.len(),
+                duration_us: scan_us,
+            });
+        }
+
+        plan.parts_skipped_by_index = parts_skipped_by_index;
+
+        // Step 8: Determine output columns
+        let output_columns = self.determine_output_columns_from_schema(query, &all_schema_columns);
+
+        // Step 9: Apply aggregation or finalize results
+        let _agg_timer = span_timer("query;aggregation");
+        let agg_start = Instant::now();
+        let (result_columns, result_rows) = if is_aggregate {
+            self.apply_aggregation_columnar(
+                query,
+                &output_columns,
+                &all_rows,
+                &agg_part_columns,
+                &agg_matching_indices,
+                &all_schema_columns,
+            )
+        } else {
+            // For non-aggregate: rows are already Vec<Vec<Value>>
+            // Apply default sort by flowcusExportTime desc if no explicit sort
+            if !has_explicit_limit
+                && !query
+                    .stages
+                    .iter()
+                    .any(|s| matches!(s, Stage::Aggregate(AggExpr::Sort { .. })))
+            {
+                // Find flowcusExportTime column index in output
+                let time_col_idx = all_schema_columns
+                    .iter()
+                    .position(|c| c == "flowcusExportTime");
+                if let Some(idx) = time_col_idx {
+                    all_rows.sort_by(|a, b| {
+                        let va = a.get(idx).and_then(|v| v.as_u64()).unwrap_or(0);
+                        let vb = b.get(idx).and_then(|v| v.as_u64()).unwrap_or(0);
+                        vb.cmp(&va) // descending
+                    });
+                }
+            }
+
+            // Apply explicit query limit if present
+            let query_limit = query.stages.iter().find_map(|s| {
+                if let Stage::Aggregate(AggExpr::Limit(n)) = s {
+                    Some(*n)
+                } else {
+                    None
+                }
+            });
+            if let Some(lim) = query_limit {
+                all_rows.truncate(lim as usize);
+                total_matching_rows = total_matching_rows.min(lim);
+            }
+
+            // Map rows from part-schema column order to output column order
+            let mapped_rows =
+                self.map_rows_to_output(&all_rows, &all_schema_columns, &output_columns);
+
+            (output_columns.clone(), mapped_rows)
+        };
+
+        let agg_us = u64::try_from(agg_start.elapsed().as_micros()).ok();
+
+        // Push aggregate step if this was an aggregate query
+        if is_aggregate {
+            plan.steps.push(PlanStep::Aggregate {
+                function: "aggregation".to_string(),
+                groups: result_rows.len(),
+                duration_us: agg_us,
+            });
+        }
 
         plan.steps.push(PlanStep::FilterApply {
-            expression: format!("{} filter(s)", filters.len()),
+            expression: format!("{} filter(s)", ast_filters.len()),
             rows_before: total_rows_scanned as usize,
-            rows_after: all_rows.len(),
+            rows_after: total_matching_rows as usize,
+            duration_us: None, // filter timing is per-part in process_part_columnar
         });
+
+        // Step 10: Apply pagination (offset/limit) to the result
+        let total_result_rows = result_rows.len() as u64;
+        let paginated_rows = if !is_aggregate {
+            let start = (offset as usize).min(result_rows.len());
+            let end = (start + limit as usize).min(result_rows.len());
+            result_rows[start..end].to_vec()
+        } else {
+            total_matching_rows = total_result_rows;
+            result_rows
+        };
 
         let total_parts_skipped =
             (plan.parts_skipped_by_time + parts_skipped_by_index + parts_skipped_by_merge) as u64;
@@ -1286,20 +1811,258 @@ impl QueryExecutor {
             .saturating_sub(parts_skipped_by_index)
             .saturating_sub(parts_skipped_by_merge) as u64;
 
+        // Append storage cache statistics
+        let (cache_hits, cache_misses) = self.cache.stats();
+        plan.steps.push(PlanStep::CacheStats {
+            hits: cache_hits,
+            misses: cache_misses,
+        });
+
         Ok(QueryResult {
             columns: result_columns,
-            rows: result_rows,
+            rows: paginated_rows,
             plan,
             rows_scanned: total_rows_scanned,
             parts_scanned: total_parts_scanned,
             parts_skipped: total_parts_skipped,
+            total_matching_rows,
+            total_rows_in_range,
+            time_start,
+            time_end,
         })
     }
 
-    fn determine_output_columns(
+    /// Map rows from part-schema column ordering to output column ordering.
+    fn map_rows_to_output(
+        &self,
+        rows: &[Vec<serde_json::Value>],
+        schema_columns: &[String],
+        output_columns: &[String],
+    ) -> Vec<Vec<serde_json::Value>> {
+        // Build index mapping: output_col -> schema_col index
+        let index_map: Vec<Option<usize>> = output_columns
+            .iter()
+            .map(|out_col| schema_columns.iter().position(|s| s == out_col))
+            .collect();
+
+        rows.iter()
+            .map(|row| {
+                index_map
+                    .iter()
+                    .map(|idx| {
+                        idx.and_then(|i| row.get(i))
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Try to answer an aggregation query from pre-computed .stats files.
+    ///
+    /// Returns `Some(Ok(result))` if the shortcut succeeded, `Some(Err(..))` on
+    /// I/O error, or `None` if the query shape doesn't support the shortcut
+    /// (caller should fall through to the normal execution path).
+    ///
+    /// Supported query shapes (all require NO filter stages):
+    /// - `group by <time_bucket> | sum/count/min/max(field)`
+    /// - `top N by sum/count/min/max(field)` (without group by)
+    /// - `sort sum/count/min/max(field) desc/asc`
+    #[allow(clippy::too_many_arguments)]
+    fn try_stats_shortcut(
         &self,
         query: &Query,
-        rows: &[HashMap<String, serde_json::Value>],
+        parts: &[PartEntry],
+        plan: &mut ExecutionPlan,
+        time_start: u32,
+        time_end: u32,
+        _parts_after_time: usize,
+        total_rows_in_range: u64,
+        step_start: Instant,
+    ) -> Option<std::io::Result<QueryResult>> {
+        // Per-aggregate accumulator used by the stats shortcut.
+        struct AggAccum {
+            sum: u64,
+            min: u64,
+            max: u64,
+            count: u64,
+            func: AggFunc,
+            field_name: String,
+        }
+
+        // Extract the aggregation stage
+        let agg_stage = query.stages.iter().find_map(|s| {
+            if let Stage::Aggregate(agg) = s {
+                Some(agg)
+            } else {
+                None
+            }
+        })?;
+
+        // Check which agg functions we need and if they're all stats-compatible
+        let agg_calls: Vec<&AggCall> = match agg_stage {
+            AggExpr::GroupBy { functions, .. } => functions.iter().collect(),
+            AggExpr::TopN { by, .. } => vec![by],
+            AggExpr::Sort { by, .. } => vec![by],
+            AggExpr::Limit(_) => return None,
+        };
+
+        // All functions must be stats-compatible
+        for call in &agg_calls {
+            match call.func {
+                AggFunc::Sum | AggFunc::Count | AggFunc::Min | AggFunc::Max => {}
+                _ => return None, // Avg, Uniq, P50, P95, P99, Stddev, Rate, First, Last
+            }
+        }
+
+        // For GroupBy: only single time bucket key supported (no field-based grouping)
+        // because stats don't have per-value breakdowns.
+        if let AggExpr::GroupBy { keys, .. } = agg_stage {
+            if keys.len() != 1 {
+                return None;
+            }
+            if !matches!(keys[0], GroupByKey::TimeBucket(_)) {
+                return None;
+            }
+        }
+
+        // Read stats from each part and aggregate
+        let mut total_rows: u64 = 0;
+        let mut parts_scanned: u64 = 0;
+
+        // For each agg function, accumulate the result across all parts
+        let mut accums: Vec<AggAccum> = agg_calls
+            .iter()
+            .map(|call| AggAccum {
+                sum: 0,
+                min: u64::MAX,
+                max: 0,
+                count: 0,
+                func: call.func,
+                field_name: call
+                    .field
+                    .as_ref()
+                    .map(|f| resolve_field_name(f).to_string())
+                    .unwrap_or_default(),
+            })
+            .collect();
+
+        for part_entry in parts {
+            if part_entry.path.join(".merging").exists() {
+                continue;
+            }
+
+            // Get row count from meta.bin for this part
+            let meta_path = part_entry.path.join("meta.bin");
+            let part_row_count = match self.cache.get_meta(&meta_path).map(|(m, _)| m) {
+                Ok(meta) => meta.row_count,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => continue,
+            };
+            total_rows += part_row_count;
+
+            for accum in &mut accums {
+                if accum.func == AggFunc::Count && accum.field_name.is_empty() {
+                    // count() — just use the meta row count
+                    accum.count += part_row_count;
+                } else {
+                    // sum/min/max/count(field) — read .stats file
+                    let stats_path = part_entry
+                        .path
+                        .join("columns")
+                        .join(format!("{}.stats", accum.field_name));
+
+                    match granule::read_stats(&stats_path) {
+                        Ok((granule_stats, _st)) => {
+                            let col_stats = granule::aggregate_column_stats(&granule_stats);
+                            accum.sum = accum.sum.wrapping_add(col_stats.sum);
+                            accum.min = accum.min.min(col_stats.min);
+                            accum.max = accum.max.max(col_stats.max);
+                            accum.count += col_stats.row_count;
+                        }
+                        Err(_) => {
+                            // .stats file missing (v0 part not yet migrated) — fall back
+                            return None;
+                        }
+                    }
+                }
+            }
+            parts_scanned += 1;
+        }
+
+        // Build result columns and rows
+        let mut col_names = Vec::new();
+        let mut row_values = Vec::new();
+
+        // For GroupBy with time bucket, add the bucket column
+        if let AggExpr::GroupBy { keys, .. } = agg_stage {
+            if let Some(GroupByKey::TimeBucket(_)) = keys.first() {
+                col_names.push("time_bucket".to_string());
+                // Single bucket covering the query range
+                row_values.push(serde_json::Value::Number(serde_json::Number::from(
+                    time_start,
+                )));
+            }
+        }
+
+        for accum in &accums {
+            let name = if accum.field_name.is_empty() {
+                format!("{:?}()", accum.func).to_lowercase()
+            } else {
+                format!("{:?}({})", accum.func, accum.field_name).to_lowercase()
+            };
+            col_names.push(name);
+
+            let value: serde_json::Value = match accum.func {
+                AggFunc::Sum => serde_json::json!(accum.sum),
+                AggFunc::Count => serde_json::json!(accum.count),
+                AggFunc::Min => {
+                    if accum.min == u64::MAX {
+                        serde_json::json!(0)
+                    } else {
+                        serde_json::json!(accum.min)
+                    }
+                }
+                AggFunc::Max => serde_json::json!(accum.max),
+                _ => serde_json::json!(0),
+            };
+            row_values.push(value);
+        }
+
+        // For TopN/Sort with stats, we don't have per-row data — return
+        // a single aggregated row. This handles queries like
+        // `top 10 by sum(bytes)` which across the whole dataset returns
+        // the aggregate sum (not individual rows, since that needs data).
+        // The caller gets a meaningful answer without reading column data.
+        let result_rows = vec![row_values];
+
+        let total_parts_skipped = (plan.parts_skipped_by_time) as u64;
+
+        plan.steps.push(PlanStep::StatsShortcut {
+            parts_used: parts.len(),
+            duration_us: u64::try_from(step_start.elapsed().as_micros()).ok(),
+        });
+
+        Some(Ok(QueryResult {
+            columns: col_names,
+            rows: result_rows,
+            plan: std::mem::take(plan),
+            rows_scanned: total_rows,
+            total_matching_rows: 1,
+            total_rows_in_range,
+            parts_scanned,
+            parts_skipped: total_parts_skipped,
+            time_start,
+            time_end,
+        }))
+    }
+
+    /// Determine output columns from the query and discovered schema columns.
+    fn determine_output_columns_from_schema(
+        &self,
+        query: &Query,
+        schema_columns: &[String],
     ) -> Vec<String> {
         for stage in &query.stages {
             if let Stage::Select(sel) = stage {
@@ -1326,45 +2089,87 @@ impl QueryExecutor {
                             .collect();
                     }
                     SelectExpr::All => {
-                        // Return all columns we have
-                        if let Some(first) = rows.first() {
-                            let mut cols: Vec<String> = first.keys().cloned().collect();
-                            cols.sort();
-                            return cols;
-                        }
+                        let mut cols = schema_columns.to_vec();
+                        cols.sort();
+                        return cols;
                     }
                     SelectExpr::AllExcept(excluded) => {
-                        if let Some(first) = rows.first() {
-                            let mut cols: Vec<String> = first
-                                .keys()
-                                .filter(|k| !excluded.contains(k))
-                                .cloned()
-                                .collect();
-                            cols.sort();
-                            return cols;
-                        }
+                        let mut cols: Vec<String> = schema_columns
+                            .iter()
+                            .filter(|c| !excluded.contains(c))
+                            .cloned()
+                            .collect();
+                        cols.sort();
+                        return cols;
                     }
                 }
             }
         }
 
-        // Default: return all columns
-        if let Some(first) = rows.first() {
-            let mut cols: Vec<String> = first.keys().cloned().collect();
-            cols.sort();
-            cols
-        } else {
-            Vec::new()
-        }
+        // Default (no select stage): return all schema columns sorted
+        let mut cols = schema_columns.to_vec();
+        cols.sort();
+        cols
     }
 
-    fn apply_aggregation(
+    /// Apply aggregation for aggregate queries, operating on columnar data
+    /// when possible.
+    fn apply_aggregation_columnar(
+        &self,
+        query: &Query,
+        output_columns: &[String],
+        json_rows: &[Vec<serde_json::Value>],
+        agg_part_columns: &[HashMap<String, ColumnBuffer>],
+        agg_matching_indices: &[(usize, u32)],
+        schema_columns: &[String],
+    ) -> (Vec<String>, Vec<Vec<serde_json::Value>>) {
+        // If we have json_rows (from non-columnar path), convert to HashMap for
+        // backward compat with the existing aggregation code
+        if !json_rows.is_empty() {
+            let hash_rows: Vec<HashMap<String, serde_json::Value>> = json_rows
+                .iter()
+                .map(|row| {
+                    schema_columns
+                        .iter()
+                        .zip(row.iter())
+                        .map(|(name, val)| (name.clone(), val.clone()))
+                        .collect()
+                })
+                .collect();
+            return self.apply_aggregation_hashmap(query, output_columns, &hash_rows);
+        }
+
+        // For columnar aggregate data, reconstruct HashMap rows from the column
+        // buffers. This is the path for aggregate queries that used ColumnarData.
+        if !agg_matching_indices.is_empty() {
+            let hash_rows: Vec<HashMap<String, serde_json::Value>> = agg_matching_indices
+                .iter()
+                .map(|(part_idx, row_idx)| {
+                    let cols = &agg_part_columns[*part_idx];
+                    let mut row_map = HashMap::new();
+                    for (col_name, buf) in cols {
+                        row_map.insert(
+                            col_name.clone(),
+                            column_to_json(buf, *row_idx as usize, col_name),
+                        );
+                    }
+                    row_map
+                })
+                .collect();
+            return self.apply_aggregation_hashmap(query, output_columns, &hash_rows);
+        }
+
+        // No data
+        (output_columns.to_vec(), Vec::new())
+    }
+
+    /// Apply aggregation using HashMap-based rows (shared logic).
+    fn apply_aggregation_hashmap(
         &self,
         query: &Query,
         output_columns: &[String],
         rows: &[HashMap<String, serde_json::Value>],
     ) -> (Vec<String>, Vec<Vec<serde_json::Value>>) {
-        // Find aggregation and limit stages
         let mut agg_stage = None;
         let mut limit = None;
 
@@ -1390,7 +2195,6 @@ impl QueryExecutor {
                     self.execute_sort(by, *descending, rows, output_columns, limit)
                 }
                 AggExpr::Limit(n) => {
-                    // Just limit
                     let limited: Vec<_> = rows.iter().take(*n as usize).collect();
                     let result_rows = limited
                         .iter()
@@ -1405,18 +2209,26 @@ impl QueryExecutor {
                 }
             }
         } else {
-            // Default limit: 100 rows for non-aggregate queries without explicit limit
-            let lim = limit.unwrap_or(100) as usize;
-            let result_rows = rows
-                .iter()
-                .take(lim)
-                .map(|row| {
-                    output_columns
-                        .iter()
-                        .map(|c| row.get(c).cloned().unwrap_or(serde_json::Value::Null))
-                        .collect()
-                })
-                .collect();
+            let result_rows: Vec<Vec<serde_json::Value>> = if let Some(lim) = limit {
+                rows.iter()
+                    .take(lim as usize)
+                    .map(|row| {
+                        output_columns
+                            .iter()
+                            .map(|c| row.get(c).cloned().unwrap_or(serde_json::Value::Null))
+                            .collect()
+                    })
+                    .collect()
+            } else {
+                rows.iter()
+                    .map(|row| {
+                        output_columns
+                            .iter()
+                            .map(|c| row.get(c).cloned().unwrap_or(serde_json::Value::Null))
+                            .collect()
+                    })
+                    .collect()
+            };
             (output_columns.to_vec(), result_rows)
         }
     }
@@ -1666,6 +2478,650 @@ impl QueryExecutor {
 
         (output_columns.to_vec(), result_rows)
     }
+
+    /// TopN/Sort fast path: instead of decoding all columns for all rows,
+    /// read only the sort field column, use a binary heap to identify the
+    /// top-N row indices, then decode remaining columns only for those rows.
+    ///
+    /// This reduces memory from O(rows * columns) to O(rows * 1) + O(N * columns),
+    /// which is the difference between 10GB RSS and a few MB for large datasets.
+    ///
+    /// Handles both TopN and Sort stages. For Sort, N = limit or a default cap.
+    /// Also works WITH filters: applies filter first, then scans only matching
+    /// indices for the sort field.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn try_topn_fast_path(
+        &self,
+        query: &Query,
+        filtered_parts: &[PartEntry],
+        ast_filters: &[&FilterExpr],
+        resolved_filters: &[ResolvedFilter],
+        filter_col_names: &[String],
+        referenced_cols: &[String],
+        needs_all_columns: bool,
+        plan: &mut ExecutionPlan,
+        _parts_total: usize,
+        _parts_after_time: usize,
+        time_start: u32,
+        time_end: u32,
+        total_rows_in_range: u64,
+        step_start: Instant,
+    ) -> Option<std::io::Result<QueryResult>> {
+        // Extract TopN or Sort stage
+        let (n, sort_field, bottom) = self.extract_topn_params(query)?;
+
+        let _timer = span_timer("query;topn_fast_path");
+
+        debug!(
+            n,
+            sort_field,
+            bottom,
+            parts = filtered_parts.len(),
+            "TopN fast path activated"
+        );
+
+        // Use a scored-row heap to track top-N across all parts.
+        // For top-N (descending), we want a min-heap so we can evict the smallest.
+        // For bottom-N (ascending), we want a max-heap so we can evict the largest.
+        let mut heap: BinaryHeap<ScoredRow> = BinaryHeap::new();
+        let mut total_rows_scanned: u64 = 0;
+        let mut parts_scanned: u64 = 0;
+        let mut parts_skipped_merge: usize = 0;
+        let mut parts_skipped_index: usize = 0;
+
+        // We need to track which parts + row indices made it into the heap,
+        // so we can go back and decode remaining columns for just those rows.
+        // Store part paths so we can re-read columns later.
+        let mut part_paths: Vec<PathBuf> = Vec::new();
+        // Map from part index in our vec -> schema info
+        let mut part_schemas: Vec<(HashMap<String, StorageType>, Vec<String>)> = Vec::new();
+
+        for part_entry in filtered_parts {
+            if part_entry.path.join(".merging").exists() {
+                parts_skipped_merge += 1;
+                plan.steps.push(PlanStep::PartSkippedMerging {
+                    path: part_entry.path.display().to_string(),
+                });
+                continue;
+            }
+
+            // Read metadata
+            let meta = match self
+                .cache
+                .get_meta(&part_entry.path.join("meta.bin"))
+                .map(|(m, _)| m)
+            {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    parts_skipped_merge += 1;
+                    plan.steps.push(PlanStep::PartSkippedMerge {
+                        path: part_entry.path.display().to_string(),
+                    });
+                    continue;
+                }
+                Err(e) => return Some(Err(e)),
+            };
+            let row_count = meta.row_count as usize;
+
+            // Check for incomplete parts
+            match part::list_columns(&part_entry.path) {
+                Ok(cols) if cols.is_empty() => continue,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                _ => {}
+            }
+
+            // Read schema for column types
+            let schema = match part::read_schema_bin(&part_entry.path.join("schema.bin")) {
+                Ok(s) => s,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    parts_skipped_merge += 1;
+                    continue;
+                }
+                Err(_) => crate::schema::Schema {
+                    columns: Vec::new(),
+                    duration_source: None,
+                },
+            };
+
+            let col_types: HashMap<String, StorageType> = schema
+                .columns
+                .iter()
+                .map(|c| (c.name.clone(), c.storage_type))
+                .collect();
+
+            // Column index min/max pruning
+            let index_path = part_entry.path.join("column_index.bin");
+            if index_path.exists() && !ast_filters.is_empty() {
+                if let Ok(col_index) = self.cache.get_column_index(&index_path).map(|(e, _)| e) {
+                    let mut skip = false;
+                    for (i, idx_entry) in col_index.iter().enumerate() {
+                        if let Some(col_def) = schema.columns.get(i) {
+                            for filter in ast_filters {
+                                if !index_may_match(
+                                    filter,
+                                    &col_def.name,
+                                    &idx_entry.min_value,
+                                    &idx_entry.max_value,
+                                    col_def.storage_type,
+                                ) {
+                                    skip = true;
+                                    break;
+                                }
+                            }
+                            if skip {
+                                break;
+                            }
+                        }
+                    }
+                    if skip {
+                        parts_skipped_index += 1;
+                        continue;
+                    }
+                }
+            }
+
+            let available_columns = match part::list_columns(&part_entry.path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            // Phase 1: Decode filter columns and build matching indices
+            let matching_indices = if resolved_filters.is_empty() {
+                // No filters: all rows match
+                None // sentinel for "all rows"
+            } else {
+                let filter_cols_available: Vec<String> = filter_col_names
+                    .iter()
+                    .filter(|c| available_columns.contains(c))
+                    .cloned()
+                    .collect();
+
+                let mut decoded_filter: HashMap<String, ColumnBuffer> = HashMap::new();
+                for col_name in &filter_cols_available {
+                    let col_path = part_entry
+                        .path
+                        .join("columns")
+                        .join(format!("{col_name}.col"));
+                    if !col_path.exists() {
+                        continue;
+                    }
+                    let st = col_types.get(col_name).copied().unwrap_or(StorageType::U32);
+                    match decode::decode_column(&col_path, st) {
+                        Ok(buf) => {
+                            decoded_filter.insert(col_name.clone(), buf);
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            return Some(Err(e));
+                        }
+                        Err(_) => {}
+                    }
+                }
+
+                let granule_size = self.granule_size.max(1);
+                let mut indices = Vec::new();
+                for row_idx in 0..row_count {
+                    let _ = granule_size; // granule mask not applied in fast path for simplicity
+                    let passes = resolved_filters
+                        .iter()
+                        .all(|f| evaluate_resolved_filter(f, row_idx, &decoded_filter));
+                    if passes {
+                        indices.push(row_idx as u32);
+                    }
+                }
+                Some(indices)
+            };
+
+            // Phase 2: Decode ONLY the sort field column
+            let sort_col_path = part_entry
+                .path
+                .join("columns")
+                .join(format!("{sort_field}.col"));
+            if !sort_col_path.exists() {
+                // Sort field not in this part — skip it
+                total_rows_scanned += row_count as u64;
+                parts_scanned += 1;
+                continue;
+            }
+
+            let sort_st = col_types
+                .get(&sort_field)
+                .copied()
+                .unwrap_or(StorageType::U64);
+            let sort_buf = match decode::decode_column(&sort_col_path, sort_st) {
+                Ok(buf) => buf,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    parts_skipped_merge += 1;
+                    continue;
+                }
+                Err(e) => {
+                    debug!(error = %e, "Failed to decode sort column");
+                    continue;
+                }
+            };
+
+            let part_idx = part_paths.len();
+            part_paths.push(part_entry.path.clone());
+            let col_names: Vec<String> = available_columns.clone();
+            part_schemas.push((col_types.clone(), col_names));
+
+            // Phase 3: Scan sort values, maintain top-N heap
+            let rows_to_scan: Box<dyn Iterator<Item = u32>> = match &matching_indices {
+                Some(indices) => Box::new(indices.iter().copied()),
+                None => Box::new(0..row_count as u32),
+            };
+
+            for row_idx in rows_to_scan {
+                let value = column_get_u64(&sort_buf, row_idx as usize);
+                let scored = ScoredRow {
+                    part_idx,
+                    row_idx,
+                    value,
+                    bottom,
+                };
+
+                if heap.len() < n {
+                    heap.push(scored);
+                } else if let Some(worst) = heap.peek() {
+                    let dominated = if bottom {
+                        // For bottom-N (ascending), max-heap: evict if new value is smaller
+                        value < worst.value
+                    } else {
+                        // For top-N (descending), min-heap via Reverse ordering: evict if new value is larger
+                        value > worst.value
+                    };
+                    if dominated {
+                        heap.pop();
+                        heap.push(scored);
+                    }
+                }
+            }
+
+            total_rows_scanned += row_count as u64;
+            parts_scanned += 1;
+        }
+
+        // Phase 4: Extract top-N results and decode remaining columns
+        let mut top_rows: Vec<ScoredRow> = heap.into_vec();
+        // Sort in final order: descending for top, ascending for bottom
+        if bottom {
+            top_rows.sort_by(|a, b| a.value.cmp(&b.value));
+        } else {
+            top_rows.sort_by(|a, b| b.value.cmp(&a.value));
+        }
+
+        plan.steps.push(PlanStep::TopNFastPath {
+            sort_field: sort_field.clone(),
+            n,
+            parts_scanned: parts_scanned as usize,
+            rows_scanned: total_rows_scanned,
+            duration_us: u64::try_from(step_start.elapsed().as_micros()).ok(),
+        });
+        plan.parts_skipped_by_index = parts_skipped_index;
+
+        // Determine output columns
+        let mut all_schema_columns: Vec<String> = Vec::new();
+        for (_, col_names) in &part_schemas {
+            for col in col_names {
+                if !all_schema_columns.contains(col) {
+                    all_schema_columns.push(col.clone());
+                }
+            }
+        }
+        let output_columns = self.determine_output_columns_from_schema(query, &all_schema_columns);
+
+        // Group top rows by part index to batch column reads
+        let mut rows_by_part: HashMap<usize, Vec<(usize, u32)>> = HashMap::new();
+        for (result_idx, scored) in top_rows.iter().enumerate() {
+            rows_by_part
+                .entry(scored.part_idx)
+                .or_default()
+                .push((result_idx, scored.row_idx));
+        }
+
+        // Decode output columns only for the top-N rows
+        let mut result_rows: Vec<Vec<serde_json::Value>> = vec![Vec::new(); top_rows.len()];
+
+        for (part_idx, row_indices) in &rows_by_part {
+            let part_path = &part_paths[*part_idx];
+            let (col_types, available) = &part_schemas[*part_idx];
+
+            // Determine which columns to read for this part
+            let cols_to_read: Vec<String> = if needs_all_columns {
+                available.clone()
+            } else {
+                referenced_cols
+                    .iter()
+                    .filter(|c| available.contains(c))
+                    .cloned()
+                    .collect()
+            };
+
+            // Also include any output columns not in referenced_cols
+            let mut all_needed: Vec<String> = cols_to_read;
+            for col in &output_columns {
+                if available.contains(col) && !all_needed.contains(col) {
+                    all_needed.push(col.clone());
+                }
+            }
+
+            // Decode needed columns for this part
+            let mut decoded: HashMap<String, ColumnBuffer> = HashMap::new();
+            for col_name in &all_needed {
+                let col_path = part_path.join("columns").join(format!("{col_name}.col"));
+                if !col_path.exists() {
+                    continue;
+                }
+                let st = col_types.get(col_name).copied().unwrap_or(StorageType::U32);
+                match decode::decode_column(&col_path, st) {
+                    Ok(buf) => {
+                        decoded.insert(col_name.clone(), buf);
+                    }
+                    Err(_) => {}
+                }
+            }
+
+            // Build result rows for these indices
+            for (result_idx, row_idx) in row_indices {
+                let row: Vec<serde_json::Value> = output_columns
+                    .iter()
+                    .map(|name| {
+                        decoded
+                            .get(name)
+                            .map(|buf| column_to_json(buf, *row_idx as usize, name))
+                            .unwrap_or(serde_json::Value::Null)
+                    })
+                    .collect();
+                result_rows[*result_idx] = row;
+            }
+        }
+
+        let total_parts_skipped =
+            (plan.parts_skipped_by_time + parts_skipped_index + parts_skipped_merge) as u64;
+
+        Some(Ok(QueryResult {
+            columns: output_columns,
+            rows: result_rows,
+            plan: std::mem::take(plan),
+            rows_scanned: total_rows_scanned,
+            parts_scanned,
+            parts_skipped: total_parts_skipped,
+            total_matching_rows: n as u64,
+            total_rows_in_range,
+            time_start,
+            time_end,
+        }))
+    }
+
+    /// Extract TopN/Sort parameters from the query stages.
+    /// Returns (n, sort_field_name, is_bottom) or None if not a TopN/Sort query.
+    fn extract_topn_params(&self, query: &Query) -> Option<(usize, String, bool)> {
+        let mut limit_val: Option<u64> = None;
+
+        for stage in &query.stages {
+            if let Stage::Aggregate(AggExpr::Limit(n)) = stage {
+                limit_val = Some(*n);
+            }
+        }
+
+        for stage in &query.stages {
+            match stage {
+                Stage::Aggregate(AggExpr::TopN { n, by, bottom }) => {
+                    let field = by
+                        .field
+                        .as_ref()
+                        .map(|f| resolve_field_name(f).to_string())?;
+                    return Some((*n as usize, field, *bottom));
+                }
+                Stage::Aggregate(AggExpr::Sort { by, descending }) => {
+                    let field = by
+                        .field
+                        .as_ref()
+                        .map(|f| resolve_field_name(f).to_string())?;
+                    // For Sort, use the explicit limit or a default cap
+                    let n = limit_val.unwrap_or(10_000) as usize;
+                    return Some((n, field, !*descending));
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Build a time histogram using granule marks and bloom filters.
+    ///
+    /// Reads `flowcusExportTime.mrk` per part for precise per-granule time
+    /// ranges and row counts. When filters are present, checks `.bloom` files
+    /// to estimate which granules might match (upper-bound estimate).
+    ///
+    /// Processes parts from newest to oldest. Calls `on_progress` after each
+    /// part so callers can stream partial results.
+    pub fn histogram_from_metadata(
+        &self,
+        time_start: u32,
+        time_end: u32,
+        bucket_secs: u32,
+        bloom_lookups: &[(String, Vec<u8>)],
+        mut on_progress: impl FnMut(&HistogramResult),
+    ) -> std::io::Result<HistogramResult> {
+        let table = Table::open(self.table_base.parent().unwrap_or(Path::new(".")), "flows")?;
+        let mut filtered_parts = table.list_parts(Some(time_start), Some(time_end))?;
+
+        // Process large merged parts first (they cover the most time), then
+        // newest raw parts. This fills the histogram bulk on the first events.
+        filtered_parts.sort_by(|a, b| {
+            b.generation
+                .cmp(&a.generation)
+                .then(b.time_max.cmp(&a.time_max))
+        });
+
+        // Build aligned buckets
+        let aligned_start = (time_start / bucket_secs) * bucket_secs;
+        let num_buckets = time_end.saturating_sub(aligned_start).div_ceil(bucket_secs) as usize;
+        let mut buckets: Vec<(u32, u64)> = (0..num_buckets)
+            .map(|i| (aligned_start + (i as u32) * bucket_secs, 0u64))
+            .collect();
+
+        let mut total_rows: u64 = 0;
+        let mut last_emitted_rows: u64 = 0;
+        let mut parts_since_emit: usize = 0;
+
+        for pe in &filtered_parts {
+            if pe.path.join(".merging").exists() {
+                continue;
+            }
+
+            let mrk_path = pe.path.join("columns/flowcusExportTime.mrk");
+            let marks_result = self.cache.get_marks(&mrk_path);
+
+            match marks_result {
+                Ok((_granule_size, ref marks, _cached)) if !marks.is_empty() => {
+                    // --- Granule-level path (v1+ parts) ---
+
+                    // Build per-granule bloom mask if bloom lookups are requested.
+                    // A granule is masked out only if ALL bloom filters agree it
+                    // doesn't match (AND across columns).
+                    let bloom_mask: Option<Vec<bool>> = if bloom_lookups.is_empty() {
+                        None
+                    } else {
+                        // Start with all granules potentially matching
+                        let mut mask = vec![true; marks.len()];
+
+                        for (col_name, value_bytes) in bloom_lookups {
+                            let bloom_path = pe.path.join(format!("columns/{col_name}.bloom"));
+                            let blooms = match self.cache.get_blooms(&bloom_path) {
+                                Ok((_bits, blooms, _cached)) => blooms,
+                                Err(_) => continue, // no bloom for this column: skip
+                            };
+                            // AND semantics: mask out granules that definitely don't match
+                            for (i, masked) in mask.iter_mut().enumerate() {
+                                if *masked {
+                                    if let Some(bloom) = blooms.get(i) {
+                                        if !bloom.may_contain(value_bytes) {
+                                            *masked = false;
+                                        }
+                                    }
+                                    // If bloom index out of range, assume might match
+                                }
+                            }
+                        }
+
+                        Some(mask)
+                    };
+
+                    for (gi, mark) in marks.iter().enumerate() {
+                        // Skip granules masked out by bloom filters
+                        if let Some(ref mask) = bloom_mask {
+                            if !mask[gi] {
+                                continue;
+                            }
+                        }
+
+                        if mark.row_count == 0 {
+                            continue;
+                        }
+
+                        let g_min = u32::from_le_bytes(mark.min_value[..4].try_into().unwrap());
+                        let g_max = u32::from_le_bytes(mark.max_value[..4].try_into().unwrap());
+
+                        let row_count = u64::from(mark.row_count);
+                        total_rows += row_count;
+
+                        Self::distribute_rows_to_buckets(
+                            &mut buckets,
+                            g_min,
+                            g_max,
+                            row_count,
+                            bucket_secs,
+                        );
+                    }
+                }
+                _ => {
+                    // --- Fallback path (v0 parts or missing marks) ---
+                    let meta_path = pe.path.join("meta.bin");
+                    let meta = match self.cache.get_meta(&meta_path) {
+                        Ok((m, _)) => m,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(e) => return Err(e),
+                    };
+
+                    if meta.row_count == 0 {
+                        continue;
+                    }
+                    total_rows += meta.row_count;
+
+                    Self::distribute_rows_to_buckets(
+                        &mut buckets,
+                        meta.time_min,
+                        meta.time_max,
+                        meta.row_count,
+                        bucket_secs,
+                    );
+                }
+            }
+
+            // Only emit progress if at least 1% of total rows so far are new,
+            // or if more than 3 parts have been processed since last emit.
+            // This avoids flooding tiny progress events for small raw parts.
+            parts_since_emit += 1;
+            if parts_since_emit >= 3
+                || total_rows > last_emitted_rows + last_emitted_rows / 50 + 100
+            {
+                let result = HistogramResult {
+                    buckets: buckets.clone(),
+                    total_rows,
+                    time_start,
+                    time_end,
+                };
+                on_progress(&result);
+                last_emitted_rows = total_rows;
+                parts_since_emit = 0;
+            }
+        }
+
+        Ok(HistogramResult {
+            buckets,
+            total_rows,
+            time_start,
+            time_end,
+        })
+    }
+
+    /// Distribute `row_count` rows from a time range `[t_min, t_max]` into
+    /// histogram buckets proportionally by overlap.
+    fn distribute_rows_to_buckets(
+        buckets: &mut [(u32, u64)],
+        t_min: u32,
+        t_max: u32,
+        row_count: u64,
+        bucket_secs: u32,
+    ) {
+        let span = t_max.saturating_sub(t_min).max(1) as u64;
+
+        for (bucket_start, bucket_count) in buckets.iter_mut() {
+            let b_start = *bucket_start;
+            let b_end = b_start + bucket_secs;
+
+            if t_min == t_max {
+                // Single-timestamp: assign to the unique bucket [b_start, b_end)
+                if t_min >= b_start && t_min < b_end {
+                    *bucket_count += row_count;
+                }
+            } else {
+                // Overlap between [t_min, t_max] and [b_start, b_end)
+                let overlap_start = t_min.max(b_start);
+                let overlap_end = t_max.min(b_end);
+
+                if overlap_start >= overlap_end {
+                    continue;
+                }
+
+                // Proportional distribution
+                let overlap = (overlap_end - overlap_start) as u64;
+                let rows = (row_count * overlap + span / 2) / span;
+                *bucket_count += rows;
+            }
+        }
+    }
+}
+
+/// A row scored by its sort-field value, used in the TopN binary heap.
+///
+/// Ordering is reversed based on the `bottom` flag:
+/// - For top-N (descending result): min-heap, so the smallest value is at the top
+///   and gets evicted when a larger value is found.
+/// - For bottom-N (ascending result): max-heap, so the largest value is at the top
+///   and gets evicted when a smaller value is found.
+struct ScoredRow {
+    part_idx: usize,
+    row_idx: u32,
+    value: u64,
+    bottom: bool,
+}
+
+impl PartialEq for ScoredRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl Eq for ScoredRow {}
+
+impl PartialOrd for ScoredRow {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScoredRow {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        if self.bottom {
+            // Bottom-N: max-heap (largest at top, evicted first)
+            self.value.cmp(&other.value)
+        } else {
+            // Top-N: min-heap (smallest at top, evicted first)
+            other.value.cmp(&self.value)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1674,30 +3130,53 @@ impl QueryExecutor {
 
 enum ProcessPartResult {
     Skipped,
+    /// Skipped due to merge race (not found, .merging marker, etc.)
+    SkippedMerge,
+    /// Non-aggregate: rows already converted to JSON, in schema column order.
     Rows {
-        rows: Vec<HashMap<String, serde_json::Value>>,
+        rows: Vec<Vec<serde_json::Value>>,
         rows_scanned: u64,
+        output_col_names: Vec<String>,
+    },
+    /// Aggregate: keep column buffers + matching row indices to avoid
+    /// premature JSON conversion. The aggregation engine operates on
+    /// native typed columns for efficiency.
+    ColumnarData {
+        columns: HashMap<String, ColumnBuffer>,
+        matching_indices: Vec<u32>,
+        rows_scanned: u64,
+        output_col_names: Vec<String>,
     },
 }
 
 impl QueryExecutor {
-    /// Process a single part: read column index, check filters, decode, evaluate.
+    /// Process a single part using columnar filtering.
     ///
-    /// If any I/O operation fails with `NotFound`, we propagate it so the caller
-    /// can treat it as a merge-race skip (the part was merged away between
-    /// `list_parts` and now).
-    fn process_part(
+    /// Phase 1: Read metadata, check bloom/marks, decode ONLY filter columns
+    /// Phase 2: Build matching-row indices using pre-resolved filters
+    /// Phase 3: Decode remaining output columns, build Vec<Vec<Value>> directly
+    ///
+    /// This avoids the old approach of building `HashMap<String, Value>` per row
+    /// which was the primary bottleneck.
+    #[allow(clippy::too_many_arguments)]
+    fn process_part_columnar(
         &self,
         part_entry: &PartEntry,
-        filters: &[&FilterExpr],
+        ast_filters: &[&FilterExpr],
+        resolved_filters: &[ResolvedFilter],
         referenced_cols: &[String],
+        filter_col_names: &[String],
         needs_all_columns: bool,
+        is_aggregate: bool,
         plan: &mut ExecutionPlan,
     ) -> std::io::Result<ProcessPartResult> {
         let part_dir = &part_entry.path;
 
         // Read metadata — NotFound propagates to caller for merge-race handling
-        let meta = part::read_meta_bin(&part_dir.join("meta.bin"))?;
+        let meta = self
+            .cache
+            .get_meta(&part_dir.join("meta.bin"))
+            .map(|(m, _)| m)?;
         let row_count = meta.row_count as usize;
 
         // Skip incomplete parts (directory created but columns not yet written)
@@ -1723,6 +3202,7 @@ impl QueryExecutor {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
             Err(_) => crate::schema::Schema {
                 columns: Vec::new(),
+                duration_source: None,
             },
         };
 
@@ -1736,7 +3216,7 @@ impl QueryExecutor {
         // Read column index for min/max pruning
         let index_path = part_dir.join("column_index.bin");
         let col_index = if index_path.exists() {
-            match part::read_column_index(&index_path) {
+            match self.cache.get_column_index(&index_path).map(|(e, _)| e) {
                 Ok(idx) => idx,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(e),
                 Err(_) => Vec::new(),
@@ -1746,10 +3226,14 @@ impl QueryExecutor {
         };
 
         // Check column index min/max against filter predicates
-        if !col_index.is_empty() && !filters.is_empty() {
+        if !col_index.is_empty() && !ast_filters.is_empty() {
+            let idx_start = Instant::now();
+            let mut skipped_by_index = false;
+            let mut skip_column = String::new();
+            let mut skip_predicate = String::new();
             for (i, idx_entry) in col_index.iter().enumerate() {
                 if let Some(col_def) = schema.columns.get(i) {
-                    for filter in filters {
+                    for filter in ast_filters {
                         if !index_may_match(
                             filter,
                             &col_def.name,
@@ -1757,49 +3241,57 @@ impl QueryExecutor {
                             &idx_entry.max_value,
                             col_def.storage_type,
                         ) {
-                            plan.steps.push(PlanStep::ColumnIndexFilter {
-                                column: col_def.name.clone(),
-                                predicate: format!("{filter:?}").chars().take(80).collect(),
-                                parts_skipped: 1,
-                            });
-                            return Ok(ProcessPartResult::Skipped);
+                            skipped_by_index = true;
+                            skip_column = col_def.name.clone();
+                            skip_predicate = format!("{filter:?}").chars().take(80).collect();
+                            break;
                         }
+                    }
+                    if skipped_by_index {
+                        break;
                     }
                 }
             }
+            let idx_dur = u64::try_from(idx_start.elapsed().as_micros()).ok();
+            plan.steps.push(PlanStep::ColumnIndexFilter {
+                column: if skipped_by_index {
+                    skip_column
+                } else {
+                    "all".to_string()
+                },
+                predicate: if skipped_by_index {
+                    skip_predicate
+                } else {
+                    "pass".to_string()
+                },
+                parts_skipped: usize::from(skipped_by_index),
+                duration_us: idx_dur,
+            });
+            if skipped_by_index {
+                return Ok(ProcessPartResult::Skipped);
+            }
         }
 
-        // Determine which columns to actually read
-        // list_columns does readdir — NotFound propagates for merge-race handling
-        let columns_to_read: Vec<String> = if needs_all_columns {
-            part::list_columns(part_dir)?
-        } else {
-            let available = part::list_columns(part_dir)?;
-            referenced_cols
-                .iter()
-                .filter(|c| available.contains(c))
-                .cloned()
-                .collect()
-        };
-
-        if columns_to_read.is_empty() {
+        // Determine available columns in this part
+        let available_columns = part::list_columns(part_dir)?;
+        if available_columns.is_empty() {
             return Ok(ProcessPartResult::Skipped);
         }
 
         // Bloom filter check for equality predicates
-        let bloom_lookups = filters
+        let bloom_lookups = ast_filters
             .iter()
             .flat_map(|f| bloom_lookup_bytes(f))
             .collect::<Vec<_>>();
 
-        // For each bloom lookup, check if any granule might contain the value
         let mut granule_mask: Option<Vec<bool>> = None;
         let num_granules = (row_count + self.granule_size - 1) / self.granule_size.max(1);
         plan.granules_total += num_granules;
 
         for (col_name, value_bytes) in &bloom_lookups {
+            let bloom_step_start = Instant::now();
             let bloom_path = part_dir.join("columns").join(format!("{col_name}.bloom"));
-            let bloom_result = granule::read_blooms(&bloom_path);
+            let bloom_result = self.cache.get_blooms(&bloom_path);
             if let Err(e) = &bloom_result {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     return Err(std::io::Error::new(
@@ -1808,7 +3300,7 @@ impl QueryExecutor {
                     ));
                 }
             }
-            if let Ok((_bits, blooms)) = bloom_result {
+            if let Ok((_bits, blooms, _cached)) = bloom_result {
                 let mask = granule_mask.get_or_insert_with(|| vec![true; blooms.len()]);
                 let mut skipped = 0usize;
                 for (gi, bloom) in blooms.iter().enumerate() {
@@ -1819,21 +3311,32 @@ impl QueryExecutor {
                         }
                     }
                 }
-                if skipped > 0 {
-                    plan.granules_skipped_by_bloom += skipped;
-                    plan.steps.push(PlanStep::BloomFilter {
-                        column: col_name.clone(),
-                        value: format!("{value_bytes:?}").chars().take(40).collect(),
-                        granules_skipped: skipped,
-                    });
-                }
+                plan.granules_skipped_by_bloom += skipped;
+                plan.steps.push(PlanStep::BloomFilter {
+                    column: col_name.clone(),
+                    value: format!("{value_bytes:?}").chars().take(40).collect(),
+                    granules_skipped: skipped,
+                    duration_us: u64::try_from(bloom_step_start.elapsed().as_micros()).ok(),
+                });
             }
         }
 
         // Mark-based seeking for range predicates
-        for col_name in &columns_to_read {
+        // (check all columns, not just the ones we'll decode)
+        let mark_check_cols: Vec<String> = if needs_all_columns {
+            available_columns.clone()
+        } else {
+            referenced_cols
+                .iter()
+                .filter(|c| available_columns.contains(c))
+                .cloned()
+                .collect()
+        };
+
+        for col_name in &mark_check_cols {
+            let mark_step_start = Instant::now();
             let marks_path = part_dir.join("columns").join(format!("{col_name}.mrk"));
-            let marks_result = granule::read_marks(&marks_path);
+            let marks_result = self.cache.get_marks(&marks_path);
             if let Err(e) = &marks_result {
                 if e.kind() == std::io::ErrorKind::NotFound {
                     return Err(std::io::Error::new(
@@ -1842,16 +3345,15 @@ impl QueryExecutor {
                     ));
                 }
             }
-            if let Ok((_gs, marks)) = marks_result {
+            if let Ok((_gs, marks, _cached)) = marks_result {
                 let st = col_types.get(col_name).copied().unwrap_or(StorageType::U32);
                 let mut mark_skipped = 0usize;
 
                 for (gi, mark) in marks.iter().enumerate() {
                     let mask = granule_mask.get_or_insert_with(|| vec![true; marks.len()]);
                     if gi < mask.len() && mask[gi] {
-                        // Check mark min/max against filters
                         let mut can_skip = false;
-                        for filter in filters {
+                        for filter in ast_filters {
                             if !index_may_match(
                                 filter,
                                 col_name,
@@ -1870,72 +3372,197 @@ impl QueryExecutor {
                     }
                 }
 
-                if mark_skipped > 0 {
-                    plan.granules_skipped_by_marks += mark_skipped;
-                    plan.steps.push(PlanStep::MarkSeek {
-                        column: col_name.clone(),
-                        granule_range: (0, num_granules),
-                    });
-                }
+                plan.granules_skipped_by_marks += mark_skipped;
+                plan.steps.push(PlanStep::MarkSeek {
+                    column: col_name.clone(),
+                    granule_range: (0, num_granules),
+                    duration_us: u64::try_from(mark_step_start.elapsed().as_micros()).ok(),
+                });
             }
         }
 
-        // Decode columns
+        // ---------------------------------------------------------------
+        // Phase 1: Decode ONLY filter columns
+        // ---------------------------------------------------------------
+        let filter_cols_available: Vec<String> = filter_col_names
+            .iter()
+            .filter(|c| available_columns.contains(c))
+            .cloned()
+            .collect();
+
+        // Parallel column decode for filter columns
+        let filter_col_results: Vec<_> = filter_cols_available
+            .par_iter()
+            .filter_map(|col_name| {
+                let col_read_start = Instant::now();
+                let col_path = part_dir.join("columns").join(format!("{col_name}.col"));
+                if !col_path.exists() {
+                    return None;
+                }
+                let st = col_types.get(col_name).copied().unwrap_or(StorageType::U32);
+                match decode::decode_column(&col_path, st) {
+                    Ok(buf) => {
+                        let bytes = buf.mem_size() as u64;
+                        let dur = u64::try_from(col_read_start.elapsed().as_micros()).ok();
+                        Some(Ok((col_name.clone(), buf, bytes, dur)))
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Err(e)),
+                    Err(e) => {
+                        trace!(error = %e, column = col_name, "Failed to decode column");
+                        None
+                    }
+                }
+            })
+            .collect();
+
         let mut decoded: HashMap<String, ColumnBuffer> = HashMap::new();
-        for col_name in &columns_to_read {
-            let col_path = part_dir.join("columns").join(format!("{col_name}.col"));
-            if !col_path.exists() {
-                continue;
-            }
-            let st = col_types.get(col_name).copied().unwrap_or(StorageType::U32);
-            match decode::decode_column(&col_path, st) {
-                Ok(buf) => {
-                    let bytes = buf.mem_size() as u64;
+        for result in filter_col_results {
+            match result {
+                Ok((name, buf, bytes, dur)) => {
+                    plan.bytes_read += bytes;
                     plan.steps.push(PlanStep::ColumnRead {
-                        column: col_name.clone(),
+                        column: name.clone(),
                         bytes,
+                        duration_us: dur,
                     });
-                    decoded.insert(col_name.clone(), buf);
+                    decoded.insert(name, buf);
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(e);
-                }
-                Err(e) => {
-                    trace!(error = %e, column = col_name, "Failed to decode column");
-                }
+                Err(e) => return Err(e),
             }
         }
 
-        // Apply filters row by row, respecting granule mask
-        let mut matching_rows: Vec<HashMap<String, serde_json::Value>> = Vec::new();
+        // ---------------------------------------------------------------
+        // Phase 2: Build matching row indices using pre-resolved filters
+        // ---------------------------------------------------------------
+        let filter_start = Instant::now();
+        let mut matching_indices: Vec<u32> = Vec::new();
+        let granule_size = self.granule_size.max(1);
 
         for row_idx in 0..row_count {
             // Check granule mask
             if let Some(ref mask) = granule_mask {
-                let granule_idx = row_idx / self.granule_size.max(1);
+                let granule_idx = row_idx / granule_size;
                 if granule_idx < mask.len() && !mask[granule_idx] {
                     continue;
                 }
             }
 
-            // Evaluate filters
-            let passes = filters.is_empty()
-                || filters
+            // Evaluate pre-resolved filters
+            let passes = resolved_filters.is_empty()
+                || resolved_filters
                     .iter()
-                    .all(|f| evaluate_filter(f, row_idx, &decoded));
+                    .all(|f| evaluate_resolved_filter(f, row_idx, &decoded));
 
             if passes {
-                let mut row_map = HashMap::new();
-                for (col_name, buf) in &decoded {
-                    row_map.insert(col_name.clone(), column_to_json(buf, row_idx, col_name));
-                }
-                matching_rows.push(row_map);
+                matching_indices.push(row_idx as u32);
             }
         }
 
+        let filter_us = u64::try_from(filter_start.elapsed().as_micros()).ok();
+        if !resolved_filters.is_empty() {
+            plan.steps.push(PlanStep::FilterApply {
+                expression: format!("{} filter(s) on part", resolved_filters.len()),
+                rows_before: row_count,
+                rows_after: matching_indices.len(),
+                duration_us: filter_us,
+            });
+        }
+
+        if matching_indices.is_empty() {
+            return Ok(ProcessPartResult::Skipped);
+        }
+
+        // ---------------------------------------------------------------
+        // Phase 3: Decode output columns and build result rows
+        // ---------------------------------------------------------------
+
+        // Determine which columns to output
+        let output_col_names: Vec<String> = if needs_all_columns {
+            available_columns.clone()
+        } else {
+            referenced_cols
+                .iter()
+                .filter(|c| available_columns.contains(c))
+                .cloned()
+                .collect()
+        };
+
+        // Parallel decode of remaining output columns not already decoded
+        let remaining_cols: Vec<String> = output_col_names
+            .iter()
+            .filter(|c| !decoded.contains_key(*c))
+            .cloned()
+            .collect();
+
+        let output_col_results: Vec<_> = remaining_cols
+            .par_iter()
+            .filter_map(|col_name| {
+                let col_read_start = Instant::now();
+                let col_path = part_dir.join("columns").join(format!("{col_name}.col"));
+                if !col_path.exists() {
+                    return None;
+                }
+                let st = col_types.get(col_name).copied().unwrap_or(StorageType::U32);
+                match decode::decode_column(&col_path, st) {
+                    Ok(buf) => {
+                        let bytes = buf.mem_size() as u64;
+                        let dur = u64::try_from(col_read_start.elapsed().as_micros()).ok();
+                        Some(Ok((col_name.clone(), buf, bytes, dur)))
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(Err(e)),
+                    Err(e) => {
+                        trace!(error = %e, column = col_name, "Failed to decode column");
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        for result in output_col_results {
+            match result {
+                Ok((name, buf, bytes, dur)) => {
+                    plan.bytes_read += bytes;
+                    plan.steps.push(PlanStep::ColumnRead {
+                        column: name.clone(),
+                        bytes,
+                        duration_us: dur,
+                    });
+                    decoded.insert(name, buf);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // For aggregate queries, return columnar data to avoid premature
+        // JSON materialization. The aggregation engine will consume it directly.
+        if is_aggregate {
+            return Ok(ProcessPartResult::ColumnarData {
+                columns: decoded,
+                matching_indices,
+                rows_scanned: row_count as u64,
+                output_col_names,
+            });
+        }
+
+        // Build Vec<Vec<Value>> directly from column buffers at matching indices.
+        // Column order matches output_col_names — no HashMap involved.
+        let rows: Vec<Vec<serde_json::Value>> = matching_indices
+            .iter()
+            .map(|&idx| {
+                output_col_names
+                    .iter()
+                    .map(|name| match decoded.get(name) {
+                        Some(buf) => column_to_json(buf, idx as usize, name),
+                        None => serde_json::Value::Null,
+                    })
+                    .collect()
+            })
+            .collect();
+
         Ok(ProcessPartResult::Rows {
-            rows: matching_rows,
+            rows,
             rows_scanned: row_count as u64,
+            output_col_names,
         })
     }
 }
@@ -1952,8 +3579,9 @@ mod tests {
     fn make_part(generation: u32, time_min: u32, time_max: u32, seq: u32) -> PartEntry {
         PartEntry {
             path: PathBuf::from(format!(
-                "/tmp/test/{generation:05}_{time_min}_{time_max}_{seq:06}"
+                "/tmp/test/1_{generation:05}_{time_min}_{time_max}_{seq:06}"
             )),
+            format_version: 1,
             generation,
             time_min,
             time_max,
@@ -1971,31 +3599,25 @@ mod tests {
             granules_skipped_by_bloom: 0,
             granules_skipped_by_marks: 0,
             columns_to_read: Vec::new(),
+            bytes_read: 0,
         }
     }
 
     #[test]
     fn test_deduplicate_removes_subsumed_parts() {
-        // gen-0 part fully covered by gen-1 part -> gen-0 removed
+        // Dedup is now disabled — all parts are kept regardless of generation.
+        // The merge process itself is responsible for deleting source parts
+        // after creating the merged output.
         let mut parts = vec![
             make_part(0, 1000, 2000, 1),
             make_part(0, 2000, 3000, 2),
-            make_part(1, 1000, 3000, 3), // covers both gen-0 parts
+            make_part(1, 1000, 3000, 3),
         ];
         let mut plan = empty_plan();
         deduplicate_parts(&mut parts, &mut plan);
 
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].generation, 1);
-        assert_eq!(parts[0].seq, 3);
-        // Two subsumed steps recorded
-        assert_eq!(
-            plan.steps
-                .iter()
-                .filter(|s| matches!(s, PlanStep::PartSkippedSubsumed { .. }))
-                .count(),
-            2
-        );
+        assert_eq!(parts.len(), 3);
+        assert!(plan.steps.is_empty());
     }
 
     #[test]
@@ -2038,13 +3660,15 @@ mod tests {
 
     #[test]
     fn test_deduplicate_exact_time_match() {
-        // gen-1 has exact same time range as gen-0 -> gen-0 subsumed
+        // gen-1 has exact same time range as gen-0 -> both kept.
+        // Dedup is disabled: the merge process handles cleanup by deleting
+        // source parts after commit. If both still exist, they contain
+        // disjoint data and must both be read.
         let mut parts = vec![make_part(0, 1000, 2000, 1), make_part(1, 1000, 2000, 2)];
         let mut plan = empty_plan();
         deduplicate_parts(&mut parts, &mut plan);
 
-        assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].generation, 1);
+        assert_eq!(parts.len(), 2);
     }
 
     #[test]
@@ -2073,6 +3697,7 @@ mod tests {
         let executor = QueryExecutor::new(&tmp, 8192);
         let part_entry = PartEntry {
             path: part_dir.clone(),
+            format_version: 1,
             generation: 0,
             time_min: 1000,
             time_max: 2000,
@@ -2080,12 +3705,126 @@ mod tests {
         };
 
         let mut plan = empty_plan();
-        let result = executor.process_part(&part_entry, &[], &[], false, &mut plan);
+        let ast_filters: Vec<&FilterExpr> = vec![];
+        let resolved_filters: Vec<ResolvedFilter> = vec![];
+        let result = executor.process_part_columnar(
+            &part_entry,
+            &ast_filters,
+            &resolved_filters,
+            &[],
+            &[],
+            false,
+            false,
+            &mut plan,
+        );
         assert!(matches!(result, Ok(ProcessPartResult::Skipped)));
         assert!(
             plan.steps
                 .iter()
                 .any(|s| matches!(s, PlanStep::PartSkippedIncomplete { .. }))
         );
+    }
+
+    #[test]
+    fn test_resolved_ip_filter_exact() {
+        let filter = resolve_ip_filter(&IpFilter {
+            direction: IpDirection::Src,
+            negated: false,
+            value: IpValue::Addr("10.0.0.1".to_string()),
+        });
+        let mut columns = HashMap::new();
+        let mut col = ColumnBuffer::new(StorageType::U32);
+        // Push 10.0.0.1 as u32
+        let ip_val = u32::from(std::net::Ipv4Addr::new(10, 0, 0, 1));
+        if let ColumnBuffer::U32(ref mut v) = col {
+            v.push(ip_val);
+            v.push(ip_val + 1); // 10.0.0.2
+        }
+        columns.insert("sourceIPv4Address".to_string(), col);
+
+        let resolved = ResolvedFilter::Ip(filter);
+        assert!(evaluate_resolved_filter(&resolved, 0, &columns));
+        assert!(!evaluate_resolved_filter(&resolved, 1, &columns));
+    }
+
+    #[test]
+    fn test_resolved_cidr_filter() {
+        let filter = resolve_ip_filter(&IpFilter {
+            direction: IpDirection::Src,
+            negated: false,
+            value: IpValue::Cidr("10.0.0.0/8".to_string()),
+        });
+        let mut columns = HashMap::new();
+        let mut col = ColumnBuffer::new(StorageType::U32);
+        if let ColumnBuffer::U32(ref mut v) = col {
+            v.push(u32::from(std::net::Ipv4Addr::new(10, 1, 2, 3)));
+            v.push(u32::from(std::net::Ipv4Addr::new(192, 168, 1, 1)));
+        }
+        columns.insert("sourceIPv4Address".to_string(), col);
+
+        let resolved = ResolvedFilter::Ip(filter);
+        assert!(evaluate_resolved_filter(&resolved, 0, &columns));
+        assert!(!evaluate_resolved_filter(&resolved, 1, &columns));
+    }
+
+    #[test]
+    fn test_resolved_port_filter() {
+        let filter = resolve_port_filter(&PortFilter {
+            direction: PortDirection::Dst,
+            negated: false,
+            value: PortValue::Range(80, 443),
+        });
+        let mut columns = HashMap::new();
+        let mut col = ColumnBuffer::new(StorageType::U16);
+        if let ColumnBuffer::U16(ref mut v) = col {
+            v.push(80);
+            v.push(443);
+            v.push(8080);
+        }
+        columns.insert("destinationTransportPort".to_string(), col);
+
+        let resolved = ResolvedFilter::Port(filter);
+        assert!(evaluate_resolved_filter(&resolved, 0, &columns));
+        assert!(evaluate_resolved_filter(&resolved, 1, &columns));
+        assert!(!evaluate_resolved_filter(&resolved, 2, &columns));
+    }
+
+    #[test]
+    fn test_resolved_proto_filter() {
+        let filter = resolve_proto_filter(&ProtoFilter {
+            negated: false,
+            value: ProtoValue::Named("tcp".to_string()),
+        });
+        let mut columns = HashMap::new();
+        let mut col = ColumnBuffer::new(StorageType::U8);
+        if let ColumnBuffer::U8(ref mut v) = col {
+            v.push(6); // TCP
+            v.push(17); // UDP
+        }
+        columns.insert("protocolIdentifier".to_string(), col);
+
+        let resolved = ResolvedFilter::Proto(filter);
+        assert!(evaluate_resolved_filter(&resolved, 0, &columns));
+        assert!(!evaluate_resolved_filter(&resolved, 1, &columns));
+    }
+
+    #[test]
+    fn test_resolved_numeric_filter() {
+        let filter = resolve_numeric_filter(&NumericFilter {
+            field: "bytes".to_string(),
+            op: CompareOp::Gt,
+            value: NumericValue::WithSuffix(1, "k".to_string()),
+        });
+        let mut columns = HashMap::new();
+        let mut col = ColumnBuffer::new(StorageType::U64);
+        if let ColumnBuffer::U64(ref mut v) = col {
+            v.push(500); // < 1000
+            v.push(2000); // > 1000
+        }
+        columns.insert("octetDeltaCount".to_string(), col);
+
+        let resolved = ResolvedFilter::Numeric(filter);
+        assert!(!evaluate_resolved_filter(&resolved, 0, &columns));
+        assert!(evaluate_resolved_filter(&resolved, 1, &columns));
     }
 }

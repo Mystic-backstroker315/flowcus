@@ -90,6 +90,15 @@ test-integration:
 test-e2e:
     cargo test -p flowcus-app --test server_test
 
+# Run dockerized e2e tests (isolated — no host IPFIX interference)
+test-e2e-docker:
+    cd tests/e2e && docker compose up --build --abort-on-container-exit --exit-code-from test-runner
+    @echo "Artifacts in tests/e2e/artifacts/"
+
+# Clean up e2e docker resources
+test-e2e-docker-clean:
+    cd tests/e2e && docker compose down -v --remove-orphans
+
 # Run tests with coverage (requires cargo-llvm-cov)
 test-coverage:
     cargo llvm-cov --workspace --html

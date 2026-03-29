@@ -311,7 +311,9 @@ fn build_merge_plans(
                 Some(n) => n.to_string(),
                 None => continue,
             };
-            if let Some((generation, pmin, pmax, seq)) = crate::part::parse_part_dir_name(&name) {
+            if let Some((format_version, generation, pmin, pmax, seq)) =
+                crate::part::parse_part_dir_name_versioned(&name)
+            {
                 let path = entry.path();
                 if active.contains(&path) || generation >= MAX_GENERATION {
                     continue;
@@ -321,6 +323,7 @@ fn build_merge_plans(
                     .or_default()
                     .push(PartEntry {
                         path,
+                        format_version,
                         generation,
                         time_min: pmin,
                         time_max: pmax,
@@ -454,8 +457,8 @@ fn execute_merge(
         let (combined_buf, encoded) = merge_column(col_def, &plan.sources, &source_rows)?;
         disk_bytes += (part::COLUMN_HEADER_SIZE + encoded.data.len()) as u64;
 
-        // Recompute granule marks + bloom filters for the merged data
-        let (marks, blooms) = crate::granule::compute_granules(
+        // Recompute granule marks + bloom filters + stats for the merged data
+        let (marks, blooms, stats) = crate::granule::compute_granules(
             &combined_buf,
             &encoded.data,
             granule_size,
@@ -468,6 +471,7 @@ fn execute_merge(
             encoded,
             marks,
             blooms,
+            stats,
         });
     }
 
@@ -1101,7 +1105,10 @@ fn read_part_schema(part_dir: &Path) -> std::io::Result<Schema> {
         });
     }
 
-    Ok(Schema { columns: col_defs })
+    Ok(Schema {
+        columns: col_defs,
+        duration_source: None,
+    })
 }
 
 /// Read exporter address from meta.bin.
@@ -1282,14 +1289,16 @@ mod tests {
 
         let parts = [
             PartEntry {
-                path: hour_dir.join("00000_1711180000_1711183599_000001"),
+                path: hour_dir.join("1_00000_1711180000_1711183599_000001"),
+                format_version: 1,
                 generation: 0,
                 time_min: 1_711_180_000,
                 time_max: 1_711_183_599,
                 seq: 1,
             },
             PartEntry {
-                path: hour_dir.join("00001_1711180000_1711183599_000010"),
+                path: hour_dir.join("1_00001_1711180000_1711183599_000010"),
+                format_version: 1,
                 generation: 1,
                 time_min: 1_711_180_000,
                 time_max: 1_711_183_599,
@@ -1316,6 +1325,7 @@ mod tests {
         let parts = vec![
             PartEntry {
                 path: PathBuf::from("a"),
+                format_version: 1,
                 generation: 0,
                 time_min: 100,
                 time_max: 200,
@@ -1323,6 +1333,7 @@ mod tests {
             },
             PartEntry {
                 path: PathBuf::from("b"),
+                format_version: 1,
                 generation: 0,
                 time_min: 100,
                 time_max: 200,
@@ -1330,6 +1341,7 @@ mod tests {
             },
             PartEntry {
                 path: PathBuf::from("c"),
+                format_version: 1,
                 generation: 1,
                 time_min: 100,
                 time_max: 200,

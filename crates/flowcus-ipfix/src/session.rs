@@ -4,7 +4,7 @@
 //! Templates are cached here and used to decode data records.
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
 use tracing::{debug, trace, warn};
@@ -78,10 +78,16 @@ impl CachedTemplate {
     }
 }
 
+/// Key for interface metadata: (exporter IP, observation domain ID, interface index).
+type InterfaceKey = (IpAddr, u32, u32);
+
 /// Thread-safe store for all IPFIX template sessions.
 pub struct SessionStore {
     templates: HashMap<TemplateKey, CachedTemplate>,
     template_expiry: std::time::Duration,
+    /// Interface name metadata extracted from IPFIX option data records.
+    /// Maps (exporter_ip, observation_domain_id, if_index) → interface name.
+    interface_names: HashMap<InterfaceKey, String>,
 }
 
 impl SessionStore {
@@ -89,6 +95,7 @@ impl SessionStore {
         Self {
             templates: HashMap::new(),
             template_expiry: std::time::Duration::from_secs(template_expiry_secs),
+            interface_names: HashMap::new(),
         }
     }
 
@@ -301,6 +308,30 @@ impl SessionStore {
     pub fn template_count(&self) -> usize {
         self.templates.len()
     }
+
+    /// Store an interface name learned from an IPFIX option data record.
+    pub fn set_interface_name(
+        &mut self,
+        exporter: IpAddr,
+        domain_id: u32,
+        if_index: u32,
+        name: String,
+    ) {
+        debug!(
+            %exporter,
+            domain_id,
+            if_index,
+            name = %name,
+            "Interface name learned from option data"
+        );
+        self.interface_names
+            .insert((exporter, domain_id, if_index), name);
+    }
+
+    /// Return a snapshot of all known interface names for API exposure.
+    pub fn get_interface_names(&self) -> HashMap<(IpAddr, u32, u32), String> {
+        self.interface_names.clone()
+    }
 }
 
 #[cfg(test)]
@@ -366,5 +397,49 @@ mod tests {
         assert!(store.get_template(a1, 1, 256).is_some());
         assert!(store.get_template(a2, 1, 256).is_some());
         assert!(store.get_template(a1, 2, 256).is_none()); // different domain
+    }
+
+    #[test]
+    fn interface_name_store_and_retrieve() {
+        let mut store = SessionStore::new(1800);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        store.set_interface_name(ip, 0, 1, "GigabitEthernet0/0".to_string());
+        store.set_interface_name(ip, 0, 2, "GigabitEthernet0/1".to_string());
+
+        let names = store.get_interface_names();
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[&(ip, 0, 1)], "GigabitEthernet0/0");
+        assert_eq!(names[&(ip, 0, 2)], "GigabitEthernet0/1");
+    }
+
+    #[test]
+    fn interface_name_overwrite() {
+        let mut store = SessionStore::new(1800);
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+
+        store.set_interface_name(ip, 0, 1, "old-name".to_string());
+        store.set_interface_name(ip, 0, 1, "new-name".to_string());
+
+        let names = store.get_interface_names();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[&(ip, 0, 1)], "new-name");
+    }
+
+    #[test]
+    fn interface_names_separate_by_exporter_and_domain() {
+        let mut store = SessionStore::new(1800);
+        let ip1: IpAddr = "10.0.0.1".parse().unwrap();
+        let ip2: IpAddr = "10.0.0.2".parse().unwrap();
+
+        store.set_interface_name(ip1, 0, 1, "router1-eth0".to_string());
+        store.set_interface_name(ip2, 0, 1, "router2-eth0".to_string());
+        store.set_interface_name(ip1, 1, 1, "router1-vrf1-eth0".to_string());
+
+        let names = store.get_interface_names();
+        assert_eq!(names.len(), 3);
+        assert_eq!(names[&(ip1, 0, 1)], "router1-eth0");
+        assert_eq!(names[&(ip2, 0, 1)], "router2-eth0");
+        assert_eq!(names[&(ip1, 1, 1)], "router1-vrf1-eth0");
     }
 }

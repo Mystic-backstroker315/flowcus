@@ -42,6 +42,7 @@
     clippy::unnested_or_patterns
 )]
 
+pub mod cache;
 pub mod codec;
 pub mod column;
 pub mod crc;
@@ -51,6 +52,7 @@ pub mod granule;
 pub mod ingest;
 pub mod merge;
 pub mod metrics;
+pub mod migrate;
 pub mod part;
 pub mod pending;
 pub mod schema;

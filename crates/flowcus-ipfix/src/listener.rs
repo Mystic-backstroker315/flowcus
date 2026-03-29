@@ -146,6 +146,12 @@ impl IpfixListener {
     pub async fn template_count(&self) -> usize {
         self.session.lock().await.template_count()
     }
+
+    /// Get a handle to the shared session store.
+    /// Used by the API server to read metadata (e.g. interface names).
+    pub fn session_store(&self) -> Arc<Mutex<SessionStore>> {
+        Arc::clone(&self.session)
+    }
 }
 
 async fn run_udp(
