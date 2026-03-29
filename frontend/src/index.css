@@ -168,6 +168,13 @@
   border-bottom: 1px solid var(--border);
 }
 
+.app-logo {
+  color: var(--accent);
+  flex-shrink: 0;
+  position: relative;
+  top: 3px;
+}
+
 .app-title {
   font-size: 1.5rem;
   font-weight: 700;
@@ -2680,4 +2687,74 @@
   font-size: 0.75rem;
   color: var(--text-secondary);
   text-align: center;
+}
+
+/* === About Dialog === */
+.about-modal {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  width: 90vw;
+  max-width: 420px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+}
+
+.about-body {
+  padding: 1.5rem;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: 1rem;
+}
+
+.about-logo {
+  color: var(--accent);
+}
+
+.about-description {
+  font-size: 0.9rem;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.about-version {
+  font-family: var(--mono);
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  padding: 0.25rem 0.75rem;
+  background: var(--bg-surface-2);
+  border-radius: 4px;
+}
+
+.about-links {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.about-links a {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  text-decoration: none;
+  padding: 0.35rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  transition: all 0.15s;
+}
+
+.about-links a:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--hover-bg);
+}
+
+.about-copyright {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  opacity: 0.7;
 }

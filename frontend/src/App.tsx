@@ -5,6 +5,7 @@ import { TimeRangePicker } from './TimeRangePicker';
 import { SearchBar } from './SearchBar';
 import { ExplainGantt, type PlanStep } from './ExplainGantt';
 import { ThemeSwitcher } from './ThemeSwitcher';
+import { AboutDialog } from './AboutDialog';
 import { SettingsPanel } from './SettingsPanel';
 import { HealthPanel } from './HealthPanel';
 import { TimeHistogram } from './TimeHistogram';
@@ -274,6 +275,7 @@ export function App() {
   const [showStats, setShowStats] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [healthOpen, setHealthOpen] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
   const [queryGen, setQueryGen] = useState(0);
 
   // Query state — initialized from URL params if present
@@ -517,13 +519,40 @@ export function App() {
   return (
     <div className="app">
       <header className="app-header">
+        <svg className="app-logo" viewBox="208 208 290 290" xmlns="http://www.w3.org/2000/svg" width="25" height="25">
+          <g transform="translate(340,340)" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round">
+            <circle cx="-20" cy="-20" r="100" strokeWidth="10" />
+            <line x1="62" y1="62" x2="135" y2="135" strokeWidth="18" />
+            <g fill="currentColor" stroke="none">
+              <circle cx="10" cy="-80" r="7" />
+              <circle cx="-10" cy="-80" r="4.5" opacity="0.5" />
+              <circle cx="-23" cy="-80" r="2.5" opacity="0.2" />
+              <circle cx="-50" cy="-48" r="7" />
+              <circle cx="-70" cy="-48" r="4.5" opacity="0.5" />
+              <circle cx="-83" cy="-48" r="2.5" opacity="0.2" />
+              <circle cx="42" cy="-52" r="7" />
+              <circle cx="22" cy="-52" r="4.5" opacity="0.5" />
+              <circle cx="9" cy="-52" r="2.5" opacity="0.2" />
+              <circle cx="-28" cy="-18" r="7" />
+              <circle cx="-48" cy="-18" r="4.5" opacity="0.5" />
+              <circle cx="-61" cy="-18" r="2.5" opacity="0.2" />
+              <circle cx="50" cy="-22" r="7" />
+              <circle cx="30" cy="-22" r="4.5" opacity="0.5" />
+              <circle cx="17" cy="-22" r="2.5" opacity="0.2" />
+              <circle cx="-58" cy="12" r="7" />
+              <circle cx="-78" cy="12" r="4.5" opacity="0.5" />
+              <circle cx="30" cy="8" r="7" />
+              <circle cx="10" cy="8" r="4.5" opacity="0.5" />
+              <circle cx="-3" cy="8" r="2.5" opacity="0.2" />
+              <circle cx="2" cy="40" r="7" />
+              <circle cx="-18" cy="40" r="4.5" opacity="0.5" />
+              <circle cx="-31" cy="40" r="2.5" opacity="0.2" />
+              <circle cx="-15" cy="62" r="7" />
+              <circle cx="-35" cy="62" r="4.5" opacity="0.5" />
+            </g>
+          </g>
+        </svg>
         <h1 className="app-title">Flowcus</h1>
-        {info && (
-          <span className="app-version">
-            v{info.version}
-            {info.server.dev_mode && <span className="dev-badge">DEV</span>}
-          </span>
-        )}
         <div className="header-actions">
           <button
             className="settings-trigger"
@@ -542,6 +571,15 @@ export function App() {
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z" />
               <circle cx="12" cy="12" r="3" />
+            </svg>
+          </button>
+          <button
+            className="settings-trigger"
+            onClick={() => setAboutOpen(true)}
+            title="About Flowcus"
+          >
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z" />
             </svg>
           </button>
           <ThemeSwitcher />
@@ -685,6 +723,7 @@ export function App() {
 
       <SettingsPanel open={settingsOpen} onClose={() => setSettingsOpen(false)} />
       <HealthPanel open={healthOpen} onClose={() => setHealthOpen(false)} />
+      <AboutDialog open={aboutOpen} onClose={() => setAboutOpen(false)} version={info?.version} />
     </div>
   );
 }
