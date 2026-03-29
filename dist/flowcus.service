@@ -1,0 +1,38 @@
+[Unit]
+Description=Flowcus - IPFIX collector, storage and query system
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=flowcus
+Group=flowcus
+ExecStart=/usr/bin/flowcus --storage /var/lib/flowcus
+Restart=on-failure
+RestartSec=5
+StateDirectory=flowcus
+WorkingDirectory=/var/lib/flowcus
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/flowcus
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+
+# Networking (for binding to privileged ports if configured below 1024)
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=flowcus
+
+# Resource limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

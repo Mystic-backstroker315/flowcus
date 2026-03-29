@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        if ! getent passwd flowcus >/dev/null 2>&1; then
+            adduser --system --group --home /var/lib/flowcus --no-create-home --shell /usr/sbin/nologin flowcus
+        fi
+        mkdir -p /var/lib/flowcus
+        chown flowcus:flowcus /var/lib/flowcus
+        ;;
+esac
+
+#DEBHELPER#

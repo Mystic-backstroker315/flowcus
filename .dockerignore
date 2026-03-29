@@ -1,7 +1,9 @@
 target/
 .git/
+.github/
 .claude/
 tests/
 storage/
 frontend/node_modules/
+frontend/dist/
 *.md

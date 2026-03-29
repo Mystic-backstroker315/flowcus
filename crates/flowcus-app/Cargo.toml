@@ -25,6 +25,19 @@ clap = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 
+[package.metadata.deb]
+maintainer = "Marek Wajdzik <marek@jest.pro>"
+copyright = "2026, Marek Wajdzik"
+depends = "$auto"
+section = "net"
+priority = "optional"
+assets = [
+    ["target/release/flowcus", "usr/bin/", "755"],
+    ["../../dist/flowcus.service", "lib/systemd/system/flowcus.service", "644"],
+]
+maintainer-scripts = "../../dist/debian/"
+systemd-units = { unit-name = "flowcus", enable = false, start = false }
+
 [dev-dependencies]
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
