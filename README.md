@@ -1,223 +1,87 @@
 # Flowcus
 
-IPFIX collector with columnar storage and a query system for network flow analysis. Collects IPFIX (RFC 7011) data over UDP/TCP, decodes it using a comprehensive Information Element registry, stores it in a compressed columnar format with time-partitioned directory layout, and exposes Prometheus metrics for production observability.
+High-performance IPFIX flow collector with columnar storage and built-in query engine. Single binary, zero external dependencies.
 
-## Architecture
+Collects NetFlow/IPFIX (RFC 7011) over UDP/TCP, stores flows in a compressed columnar format with automatic compaction, and serves a web UI for real-time analysis.
 
-Five Rust crates, single-binary deployment:
+## Features
 
-```
-flowcus/
-├── crates/
-│   ├── flowcus-core/       # Config, error types, telemetry, observability, profiling
-│   ├── flowcus-ipfix/      # IPFIX protocol: wire parsing, IE registry, templates, listener
-│   ├── flowcus-storage/    # Columnar storage engine: codecs, parts, merge, granule indexes
-│   ├── flowcus-server/     # Axum web server, API routes, embedded frontend assets
-│   └── flowcus-app/        # Binary entrypoint, CLI parsing, runtime orchestration
-├── frontend/               # React 19 + TypeScript + Vite (embedded via rust-embed)
-└── flowcus.toml            # Configuration
-```
-
-### Threading Model
-
-- **Tokio runtime** handles all async I/O (HTTP, IPFIX listeners, merge coordination)
-- **`tokio::task::spawn_blocking`** handles CPU-bound work (column encoding, merge operations)
-- **Tokio semaphore** bounds concurrent merge task count
-
-## Storage Engine
-
-Columnar format inspired by ClickHouse MergeTree. Data flows: IPFIX records -> write buffers -> immutable parts on disk -> background merge.
-
-### Columnar Format
-
-Each column is stored in its own `.col` file with a 64-byte binary header containing codec metadata. Storage types: `U8`, `U16`, `U32`, `U64`, `U128`, `Mac`, `VarLen`.
-
-### Codecs
-
-Two-layer encoding pipeline:
-1. **Transform codec** (data reshaping): `Plain`, `Delta`, `DeltaDelta`, `GCD` -- selected automatically by data analysis
-2. **Compression codec**: `None` or `LZ4` -- applied if it shrinks the result
-
-### Directory Layout
-
-Time-partitioned tree enables filesystem-level partition pruning:
-
-```
-storage/flows/{YYYY}/{MM}/{DD}/{HH}/{gen}_{min_ts}_{max_ts}_{seq}/
-  meta.bin            # 256-byte binary header (magic "FMTA", row count, time range, etc.)
-  column_index.bin    # per-column codec/type/min/max (64 bytes per column)
-  schema.bin          # column definitions (names, IE IDs, types)
-  columns/
-    {column}.col      # encoded column data with 64-byte binary header
-    {column}.mrk      # granule marks (offsets + min/max per granule)
-    {column}.bloom    # bloom filter (per-granule membership test)
-```
-
-### Parts and Merge
-
-Parts are immutable once written. The background merge system compacts parts within time partitions:
-- Coordinator (async task) scans hour directories, builds merge plans, dispatches work
-- Workers (tokio spawn_blocking) execute CPU-bound column merges
-- Throttle monitors system CPU/memory load to avoid starving ingestion
-- Generation increments on each merge: `00000` -> `00001` -> ... (max 65535)
-- Current hour: merge same-generation parts into fewer larger parts
-- Past hours: merge until a single part per hour
-
-### Granule Indexes
-
-A granule is a fixed-size group of rows (default 8192). Per granule:
-- **Marks** (`.mrk`): byte offset + min/max values for range pruning
-- **Bloom filters** (`.bloom`): probabilistic membership test for point queries
-
-### Integrity
-
-CRC32-C (Castagnoli) checksums on all binary formats: `meta.bin`, `column_index.bin`, `.col` headers, `.mrk`, `.bloom`.
-
-### System Columns
-
-Every schema is prepended with 4 system columns capturing IPFIX message metadata:
-- `flowcusExporterIPv4` -- exporter source IP
-- `flowcusExporterPort` -- exporter source port
-- `flowcusExportTime` -- IPFIX message export timestamp
-- `flowcusObservationDomainId` -- observation domain ID
-
-## IPFIX
-
-### Listeners
-
-UDP (default) and TCP listeners on port 4739. UDP receive buffer is configurable. TCP supports multiple concurrent connections.
-
-### Information Element Registry
-
-~170 IANA standard IEs plus vendor IEs from 9 vendors: Cisco, Juniper, VMware, Palo Alto, Barracuda, ntop, Fortinet, Nokia, Huawei.
-
-### Template Management
-
-Per-exporter template cache scoped by `(exporter_addr, observation_domain, template_id)`. Templates expire after a configurable interval (default 1800s). Decoded records are converted to typed `FieldValue`s.
-
-Trace-level pretty-print of decoded IPFIX messages: `RUST_LOG=flowcus_ipfix=trace`
-
-## Observability
-
-### Production Metrics
-
-Always-on Prometheus endpoint at `/observability/metrics`. Lock-free atomic counters/gauges, zero-cost in the hot path. Metrics cover:
-- IPFIX: packets received/parsed/errors, records decoded, bytes, active templates, TCP connections
-- Writer: records ingested, parts flushed, bytes flushed, buffer depth, channel drops
-- Merge: completed/failed, rows processed, bytes written, active workers, throttle count
-- Storage: total parts, gen0/gen1+ parts, disk bytes
-- Process: RSS, threads, open FDs, start time
-
-### Dev-Mode Profiling
-
-When `dev_mode = true`, captures 10-second performance snapshots to `profiling/` as compact text files. Includes system metrics and stack trace profiling with folded-stack format. Components register metric reporters; analysis is on-demand.
-
-## Configuration
-
-`flowcus.toml` with all sections:
-
-```toml
-[logging]
-# format = "human"                   # "human" or "json"
-# filter = "info,tower_http=debug"
-
-[server]
-# host = "0.0.0.0"
-# port = 2137
-# dev_mode = false
-
-[ipfix]
-# host = "0.0.0.0"
-# port = 4739
-# udp = true
-# tcp = false
-# udp_recv_buffer = 65535
-# template_expiry_secs = 1800
-
-[storage]
-# dir = "storage"
-# flush_bytes = 1048576              # 1 MB
-# flush_interval_secs = 1
-# partition_duration_secs = 3600     # 1 hour
-# channel_capacity = 4096
-# initial_row_capacity = 8192
-# merge_workers = 8
-# merge_scan_interval_secs = 5
-# merge_cpu_throttle = 0.80
-# merge_mem_throttle = 0.85
-# granule_size = 8192
-# bloom_bits_per_granule = 8192      # 1 KB per granule
-# mark_cache_bytes = 1073741824      # 1 GB
-# bloom_cache_bytes = 1073741824     # 1 GB
-```
-
-CLI overrides:
-```bash
-flowcus --dev                # Enable dev mode
-flowcus --port 8080          # Override port
-flowcus --config custom.toml # Custom config file
-FLOWCUS_DEV=1 flowcus       # Env var for dev mode
-```
+- **IPFIX/NetFlow collection** — UDP and TCP listeners, ~170 IANA IEs + 9 vendor registries (Cisco, Juniper, Palo Alto, VMware, Fortinet, ntop, Nokia, Huawei, Barracuda)
+- **Columnar storage** — Time-partitioned, generation-based merge compaction, automatic codec selection (Delta, DeltaDelta, GCD + LZ4), CRC32-C integrity on all formats
+- **Query engine** — FQL query language with typed AST, bloom filter point lookups, granule mark seeking
+- **Embedded web UI** — React frontend compiled into the binary, no separate web server needed
+- **Observability** — Prometheus metrics at `/observability/metrics`, structured JSON logging
+- **Single binary** — All components embedded, deploy by copying one file
 
 ## Quick Start
 
 ```bash
-cargo build
-./target/debug/flowcus --dev
-# HTTP server on :2137, IPFIX collector on :4739 (UDP)
-# Prometheus metrics at http://localhost:2137/observability/metrics
+# Run with defaults (HTTP :2137, IPFIX :4739/udp)
+./flowcus
+
+# Or with Docker
+docker run -p 2137:2137 -p 4739:4739/udp ghcr.io/consi/flowcus:latest
+```
+
+Open `http://localhost:2137` for the web UI.
+
+## Installation
+
+**Binary** — download from [Releases](https://github.com/consi/flowcus/releases)
+
+**Debian/Ubuntu:**
+```bash
+sudo dpkg -i flowcus_*.deb
+sudo systemctl enable --now flowcus
+```
+
+**Docker:**
+```bash
+docker run -d \
+  -p 2137:2137 \
+  -p 4739:4739/udp \
+  -v flowcus-data:/data/storage \
+  ghcr.io/consi/flowcus:latest
+```
+
+## Configuration
+
+Settings file at `{storage_dir}/flowcus.settings` (auto-created on first run):
+
+```toml
+[server]
+host = "0.0.0.0"
+port = 2137
+
+[ipfix]
+port = 4739
+udp = true
+tcp = false
+
+[storage]
+dir = "storage"
+retention_hours = 744        # 31 days, 0 = unlimited
+merge_workers = 4
+```
+
+All settings are overridable via CLI flags or environment variables:
+
+```bash
+flowcus --port 8080 --storage /var/lib/flowcus
+FLOWCUS_PORT=8080 FLOWCUS_STORAGE=/var/lib/flowcus flowcus
 ```
 
 ## Development
 
-| Command | Description |
-|---------|-------------|
-| `just dev` | Full stack dev (Vite HMR + Rust backend) |
-| `just dev-backend` | Rust server only (dev mode) |
-| `just build` | Production build (single binary) |
-| `just test` | All tests (unit + integration + e2e) |
-| `just check` | Format + lint + test |
-| `just bench` | Benchmarks |
-| `just ci` | Full local CI pipeline |
+Requires: Rust 1.85+, Node 22+, [just](https://github.com/casey/just)
 
-## API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/api/health` | GET | Health check |
-| `/api/info` | GET | Server info (version, config, workers) |
-| `/observability/metrics` | GET | Prometheus metrics |
-| `/*` | GET | Frontend SPA (embedded assets) |
-
-## Directory Structure
-
+```bash
+just dev            # Full stack (Vite HMR + Rust backend)
+just test           # Unit + integration + E2E tests
+just build          # Production release build
+just check          # Format + lint + test
 ```
-crates/flowcus-core/src/
-  config.rs          # AppConfig with all sections
-  telemetry.rs       # Tracing setup (human/json formats)
-  observability.rs   # Prometheus metrics (always-on)
-  profiling.rs       # Dev-mode performance snapshots + stack traces
-  error.rs           # Error types
 
-crates/flowcus-ipfix/src/
-  protocol.rs        # Wire format parsing (headers, sets, templates)
-  ie/                # IE registry: iana.rs, vendor.rs (9 vendors)
-  session.rs         # Per-exporter template cache
-  decoder.rs         # Template-based record decoding
-  listener.rs        # UDP + TCP async listeners
-  display.rs         # Trace-level pretty-print
+## License
 
-crates/flowcus-storage/src/
-  codec/             # Plain, Delta, DeltaDelta, GCD transforms + LZ4
-  column.rs          # In-memory column buffers
-  schema.rs          # Schema from IPFIX templates, system columns
-  writer.rs          # Buffered writer -> immutable parts
-  part.rs            # On-disk part format (binary metadata, column files)
-  granule.rs         # Marks (.mrk) + bloom filters (.bloom)
-  merge.rs           # Background merge coordinator + workers
-  pending.rs         # Pending hour tracking for merge
-  table.rs           # Table-level part registry
-  ingest.rs          # Ingestion channel (IPFIX -> writer)
-  crc.rs             # CRC32-C integrity checksums
-  metrics.rs         # Storage-specific metric reporting
-```
+[Apache-2.0](LICENSE)
