@@ -60,38 +60,7 @@ docker run -d \
 
 ## Configuration
 
-Settings file at `{storage_dir}/flowcus.settings` (auto-created on first run):
-
-```toml
-[logging]
-format = "human"              # or "json"
-
-[server]
-host = "0.0.0.0"
-port = 2137
-
-[ipfix]
-port = 4739
-udp = true
-tcp = false
-
-[storage]
-dir = "storage"
-retention_hours = 744         # 31 days, 0 = unlimited
-merge_workers = 4
-flush_interval_secs = 5
-```
-
-All settings are overridable via CLI flags or environment variables:
-
-```bash
-flowcus --port 8080 --storage /var/lib/flowcus
-flowcus --settings /etc/flowcus.settings
-flowcus --log-format json
-
-# Environment variables
-FLOWCUS_PORT=8080 FLOWCUS_STORAGE=/var/lib/flowcus flowcus
-```
+Use WebUI to configure app. Settings are stored with flow data in `flowcus.settings`
 
 ## Development
 
